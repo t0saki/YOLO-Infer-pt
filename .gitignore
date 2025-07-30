@@ -1,0 +1,7 @@
+COCO*
+__pycache__
+.DS_Store
+*.pyc
+.vscode
+debug
+weights

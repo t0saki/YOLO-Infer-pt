@@ -15,13 +15,14 @@ from utils.dataset import Dataset
 
 warnings.filterwarnings("ignore")
 
-data_dir = '../Dataset/COCO'
+data_dir = './COCO'
 
+device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
 
 def train(args, params):
     # Model
     model = nn.yolo_v11_n(len(params['names']))
-    model.cuda()
+    model.to(device)
 
     # Optimizer
     accumulate = max(round(64 / (args.batch_size * args.world_size)), 1)
@@ -60,7 +61,15 @@ def train(args, params):
                                                           output_device=args.local_rank)
 
     best = 0
-    amp_scale = torch.amp.GradScaler()
+    # 修复 MPS 设备上的混合精度训练兼容性问题
+    if device == 'cuda':
+        amp_scale = torch.amp.GradScaler()
+        use_amp = True
+    else:
+        # 对于 MPS 和 CPU 设备，不使用 GradScaler
+        amp_scale = None
+        use_amp = False
+    
     criterion = util.ComputeLoss(model, params)
 
     with open('weights/step.csv', 'w') as log:
@@ -92,10 +101,15 @@ def train(args, params):
                 step = i + num_steps * epoch
                 scheduler.step(step, optimizer)
 
-                samples = samples.cuda().float() / 255
+                samples = samples.to(device).float() / 255
 
-                # Forward
-                with torch.amp.autocast('cuda'):
+                # Forward - 修复 autocast 在不同设备上的使用
+                if use_amp and device == 'cuda':
+                    with torch.amp.autocast('cuda'):
+                        outputs = model(samples)  # forward
+                        loss_box, loss_cls, loss_dfl = criterion(outputs, targets)
+                else:
+                    # 对于 MPS 和 CPU 设备，不使用 autocast 或使用 CPU autocast
                     outputs = model(samples)  # forward
                     loss_box, loss_cls, loss_dfl = criterion(outputs, targets)
 
@@ -110,24 +124,40 @@ def train(args, params):
                 loss_cls *= args.world_size  # gradient averaged between devices in DDP mode
                 loss_dfl *= args.world_size  # gradient averaged between devices in DDP mode
 
-                # Backward
-                amp_scale.scale(loss_box + loss_cls + loss_dfl).backward()
+                # Backward - 修复梯度缩放在不同设备上的使用
+                total_loss = loss_box + loss_cls + loss_dfl
+                if use_amp and amp_scale is not None:
+                    amp_scale.scale(total_loss).backward()
+                else:
+                    total_loss.backward()
 
                 # Optimize
                 if step % accumulate == 0:
-                    # amp_scale.unscale_(optimizer)  # unscale gradients
-                    # util.clip_gradients(model)  # clip gradients
-                    amp_scale.step(optimizer)  # optimizer.step
-                    amp_scale.update()
+                    if use_amp and amp_scale is not None:
+                        # amp_scale.unscale_(optimizer)  # unscale gradients
+                        # util.clip_gradients(model)  # clip gradients
+                        amp_scale.step(optimizer)  # optimizer.step
+                        amp_scale.update()
+                    else:
+                        # util.clip_gradients(model)  # clip gradients
+                        optimizer.step()
                     optimizer.zero_grad()
                     if ema:
                         ema.update(model)
 
-                torch.cuda.synchronize()
+                # Synchronize
+                if device == 'cuda':
+                    torch.cuda.synchronize()
 
                 # Log
                 if args.local_rank == 0:
-                    memory = f'{torch.cuda.memory_reserved() / 1E9:.4g}G'  # (GB)
+                    if device == 'cuda':
+                        memory = f'{torch.cuda.memory_reserved() / 1E9:.4g}G'  # (GB)
+                    elif device == 'mps':
+                        memory = f'{torch.mps.current_allocated_memory() / 1E9:.4g}G'
+                    else:
+                        memory = 'N/A'
+                        
                     s = ('%10s' * 2 + '%10.3g' * 3) % (f'{epoch + 1}/{args.epochs}', memory,
                                                        avg_box_loss.avg, avg_cls_loss.avg, avg_dfl_loss.avg)
                     p_bar.set_description(s)
@@ -180,14 +210,14 @@ def test(args, params, model=None):
     plot = False
     if not model:
         plot = True
-        model = torch.load(f='./weights/best.pt', map_location='cuda')
+        model = torch.load(f='./weights/best.pt', map_location=device, weights_only=False)
         model = model['model'].float().fuse()
 
     model.half()
     model.eval()
 
     # Configure
-    iou_v = torch.linspace(start=0.5, end=0.95, steps=10).cuda()  # iou vector for mAP@0.5:0.95
+    iou_v = torch.linspace(start=0.5, end=0.95, steps=10).to(device)  # iou vector for mAP@0.5:0.95
     n_iou = iou_v.numel()
 
     m_pre = 0
@@ -197,11 +227,11 @@ def test(args, params, model=None):
     metrics = []
     p_bar = tqdm.tqdm(loader, desc=('%10s' * 5) % ('', 'precision', 'recall', 'mAP50', 'mAP'))
     for samples, targets in p_bar:
-        samples = samples.cuda()
+        samples = samples.to(device)
         samples = samples.half()  # uint8 to fp16/32
         samples = samples / 255.  # 0 - 255 to 0.0 - 1.0
         _, _, h, w = samples.shape  # batch-size, channels, height, width
-        scale = torch.tensor((w, h, w, h)).cuda()
+        scale = torch.tensor((w, h, w, h)).to(device)
         # Inference
         outputs = model(samples)
         # NMS
@@ -212,14 +242,14 @@ def test(args, params, model=None):
             cls = targets['cls'][idx]
             box = targets['box'][idx]
 
-            cls = cls.cuda()
-            box = box.cuda()
+            cls = cls.to(device)
+            box = box.to(device)
 
-            metric = torch.zeros(output.shape[0], n_iou, dtype=torch.bool).cuda()
+            metric = torch.zeros(output.shape[0], n_iou, dtype=torch.bool).to(device)
 
             if output.shape[0] == 0:
                 if cls.shape[0]:
-                    metrics.append((metric, *torch.zeros((2, 0)).cuda(), cls.squeeze(-1)))
+                    metrics.append((metric, *torch.zeros((2, 0)).to(device), cls.squeeze(-1)))
                 continue
             # Evaluate
             if cls.shape[0]:
@@ -296,7 +326,8 @@ def main():
     # Clean
     if args.distributed:
         torch.distributed.destroy_process_group()
-    torch.cuda.empty_cache()
+    if device == 'cuda':
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
