@@ -22,6 +22,22 @@ device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is
 def train(args, params):
     # Model
     model = nn.yolo_v11_n(len(params['names']))
+    
+    # Resume from checkpoint or load pretrained weights
+    start_epoch = 0
+    best = 0
+    if hasattr(args, 'resume') and args.resume:
+        # Resume from checkpoint
+        checkpoint = torch.load(args.resume, map_location=device)
+        model.load_state_dict(checkpoint['model'].state_dict() if hasattr(checkpoint['model'], 'state_dict') else checkpoint['model'])
+        start_epoch = checkpoint.get('epoch', 0)
+        best = checkpoint.get('best', 0)
+        print(f"Resumed training from epoch {start_epoch}")
+    elif hasattr(args, 'weights') and args.weights:
+        # Load pretrained weights
+        from utils.util import load_ultralytics_weight
+        model = load_ultralytics_weight(model, args.weights)
+        
     model.to(device)
 
     # Optimizer
@@ -30,6 +46,13 @@ def train(args, params):
 
     optimizer = torch.optim.SGD(util.set_params(model, params['weight_decay']),
                                 params['min_lr'], params['momentum'], nesterov=True)
+    
+    # Load optimizer state if resuming
+    if hasattr(args, 'resume') and args.resume:
+        checkpoint = torch.load(args.resume, map_location=device)
+        if 'optimizer' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            print("Loaded optimizer state from checkpoint")
 
     # EMA
     ema = util.EMA(model) if args.local_rank == 0 else None
@@ -79,7 +102,7 @@ def train(args, params):
                                                      'Recall', 'Precision', 'mAP@50', 'mAP'])
             logger.writeheader()
 
-        for epoch in range(args.epochs):
+        for epoch in range(start_epoch, args.epochs):
             model.train()
             if args.distributed:
                 sampler.set_epoch(epoch)
@@ -182,7 +205,10 @@ def train(args, params):
 
                 # Save model
                 save = {'epoch': epoch + 1,
-                        'model': copy.deepcopy(ema.ema)}
+                        'best': best,
+                        'model': copy.deepcopy(ema.ema) if ema else copy.deepcopy(model),
+                        'optimizer': optimizer.state_dict(),
+                        'scheduler': scheduler}
 
                 # Save last, best and delete
                 torch.save(save, f='./weights/last.pt')
@@ -210,8 +236,17 @@ def test(args, params, model=None):
     plot = False
     if not model:
         plot = True
-        model = torch.load(f='./weights/best.pt', map_location=device, weights_only=False)
-        model = model['model'].float().fuse()
+        # Check if a specific weights file was provided
+        if hasattr(args, 'weights') and args.weights:
+            # Load Ultralytics format weights
+            from utils.util import load_ultralytics_weight
+            model = nn.yolo_v11_n(len(params['names']))
+            model = load_ultralytics_weight(model, args.weights)
+            model = model.to(device)
+        else:
+            # Load default weights
+            model = torch.load(f='./weights/best.pt', map_location=device, weights_only=False)
+            model = model['model'].float().fuse()
 
     model.half()
     model.eval()
@@ -295,6 +330,8 @@ def main():
     parser.add_argument('--epochs', default=600, type=int)
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--test', action='store_true')
+    parser.add_argument('--weights', type=str, help='Path to weights file')
+    parser.add_argument('--resume', type=str, help='Path to checkpoint file for resuming training')
 
     args = parser.parse_args()
 

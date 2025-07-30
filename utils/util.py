@@ -355,6 +355,167 @@ def load_weight(model, ckpt):
     return model
 
 
+def load_ultralytics_weight(model, ckpt_path):
+    """
+    Load Ultralytics format weight file (like yolo11n.pt)
+    
+    Args:
+        model: The model architecture to load weights into
+        ckpt_path: Path to the Ultralytics format checkpoint file
+    
+    Returns:
+        model: The model with loaded weights
+    """
+    # Load the checkpoint
+    checkpoint = torch.load(ckpt_path, weights_only=False)
+    
+    # Extract the model from checkpoint
+    src_model = checkpoint['model'].float()
+    
+    # Get state dicts
+    dst_state_dict = model.state_dict()
+    src_state_dict = src_model.state_dict()
+    
+    # Create a new state dict with matching keys
+    new_state_dict = {}
+    
+    # Create a detailed mapping from Ultralytics keys to our keys
+    key_mapping = {
+        # Backbone mappings
+        '0.conv': 'net.p1.0.conv',
+        '0.bn': 'net.p1.0.norm',
+        '1.conv': 'net.p2.0.conv',
+        '1.bn': 'net.p2.0.norm',
+        '2.cv1': 'net.p2.1.conv1',
+        '2.cv2': 'net.p2.1.conv2',
+        '2.m.0.cv1': 'net.p2.1.res_m.0.conv1',
+        '2.m.0.cv2': 'net.p2.1.res_m.0.conv2',
+        '3.conv': 'net.p3.0.conv',
+        '3.bn': 'net.p3.0.norm',
+        '4.cv1': 'net.p3.1.conv1',
+        '4.cv2': 'net.p3.1.conv2',
+        '4.m.0.cv1': 'net.p3.1.res_m.0.conv1',
+        '4.m.0.cv2': 'net.p3.1.res_m.0.conv2',
+        '5.conv': 'net.p4.0.conv',
+        '5.bn': 'net.p4.0.norm',
+        '6.cv1': 'net.p4.1.conv1',
+        '6.cv2': 'net.p4.1.conv2',
+        '6.m.0.cv1': 'net.p4.1.res_m.0.conv1',
+        '6.m.0.cv2': 'net.p4.1.res_m.0.conv2',
+        '6.m.0.cv3': 'net.p4.1.res_m.0.conv3',
+        '6.m.0.m.0.cv1': 'net.p4.1.res_m.0.m.0.conv1',
+        '6.m.0.m.0.cv2': 'net.p4.1.res_m.0.m.0.conv2',
+        '6.m.0.m.1.cv1': 'net.p4.1.res_m.0.m.1.conv1',
+        '6.m.0.m.1.cv2': 'net.p4.1.res_m.0.m.1.conv2',
+        '7.conv': 'net.p5.0.conv',
+        '7.bn': 'net.p5.0.norm',
+        '8.cv1': 'net.p5.1.conv1',
+        '8.cv2': 'net.p5.1.conv2',
+        '8.m.0.cv1': 'net.p5.1.res_m.0.conv1',
+        '8.m.0.cv2': 'net.p5.1.res_m.0.conv2',
+        '8.m.0.cv3': 'net.p5.1.res_m.0.conv3',
+        '8.m.0.m.0.cv1': 'net.p5.1.res_m.0.m.0.conv1',
+        '8.m.0.m.0.cv2': 'net.p5.1.res_m.0.m.0.conv2',
+        '8.m.0.m.1.cv1': 'net.p5.1.res_m.0.m.1.conv1',
+        '8.m.0.m.1.cv2': 'net.p5.1.res_m.0.m.1.conv2',
+        '9.cv1': 'net.p5.2.conv1',
+        '9.cv2': 'net.p5.2.conv2',
+        '10.cv1': 'net.p5.3.conv1',
+        '10.cv2': 'net.p5.3.conv2',
+        '10.m.0.attn.qkv': 'net.p5.3.m.0.attn.qkv',
+        '10.m.0.attn.proj': 'net.p5.3.m.0.attn.proj',
+        '10.m.0.attn.pe': 'net.p5.3.m.0.attn.pe',
+        '10.m.0.ffn.0': 'net.p5.3.m.0.ffn.0',
+        '10.m.0.ffn.1': 'net.p5.3.m.0.ffn.1',
+        
+        # FPN mappings
+        '13.cv1': 'fpn.h1.conv1',
+        '13.cv2': 'fpn.h1.conv2',
+        '13.m.0.cv1': 'fpn.h1.res_m.0.conv1',
+        '13.m.0.cv2': 'fpn.h1.res_m.0.conv2',
+        '16.cv1': 'fpn.h2.conv1',
+        '16.cv2': 'fpn.h2.conv2',
+        '16.m.0.cv1': 'fpn.h2.res_m.0.conv1',
+        '16.m.0.cv2': 'fpn.h2.res_m.0.conv2',
+        '17.conv': 'fpn.h3.conv',
+        '17.bn': 'fpn.h3.norm',
+        '19.cv1': 'fpn.h4.conv1',
+        '19.cv2': 'fpn.h4.conv2',
+        '19.m.0.cv1': 'fpn.h4.res_m.0.conv1',
+        '19.m.0.cv2': 'fpn.h4.res_m.0.conv2',
+        '20.conv': 'fpn.h5.conv',
+        '20.bn': 'fpn.h5.norm',
+        '22.cv1': 'fpn.h6.conv1',
+        '22.cv2': 'fpn.h6.conv2',
+        '22.m.0.cv1': 'fpn.h6.res_m.0.conv1',
+        '22.m.0.cv2': 'fpn.h6.res_m.0.conv2',
+        
+        # Head mappings
+        '23.cv2.0.0': 'head.cls.0.0.conv',
+        '23.cv2.0.1': 'head.cls.0.1.conv',
+        '23.cv2.0.2': 'head.cls.0.2',
+        '23.cv2.1.0': 'head.cls.1.0.conv',
+        '23.cv2.1.1': 'head.cls.1.1.conv',
+        '23.cv2.1.2': 'head.cls.1.2',
+        '23.cv2.2.0': 'head.cls.2.0.conv',
+        '23.cv2.2.1': 'head.cls.2.1.conv',
+        '23.cv2.2.2': 'head.cls.2.2',
+        '23.cv3.0.0.0': 'head.box.0.0.conv',
+        '23.cv3.0.0.1': 'head.box.0.1.conv',
+        '23.cv3.0.1.0': 'head.box.0.2.conv',
+        '23.cv3.0.1.1': 'head.box.0.3.conv',
+        '23.cv3.0.2': 'head.box.0.4',
+        '23.cv3.1.0.0': 'head.box.1.0.conv',
+        '23.cv3.1.0.1': 'head.box.1.1.conv',
+        '23.cv3.1.1.0': 'head.box.1.2.conv',
+        '23.cv3.1.1.1': 'head.box.1.3.conv',
+        '23.cv3.1.2': 'head.box.1.4',
+        '23.cv3.2.0.0': 'head.box.2.0.conv',
+        '23.cv3.2.0.1': 'head.box.2.1.conv',
+        '23.cv3.2.1.0': 'head.box.2.2.conv',
+        '23.cv3.2.1.1': 'head.box.2.3.conv',
+        '23.cv3.2.2': 'head.box.2.4',
+        '23.dfl.conv': 'head.dfl.conv',
+    }
+    
+    # Map the keys from Ultralytics format to our format
+    for src_key, src_value in src_state_dict.items():
+        # Remove the 'model.' prefix that Ultralytics uses
+        if src_key.startswith('model.'):
+            src_key_no_prefix = src_key[6:]  # Remove 'model.' prefix
+            
+            # Try to find a direct mapping
+            dst_key = None
+            for ultralytics_prefix, our_prefix in key_mapping.items():
+                if src_key_no_prefix.startswith(ultralytics_prefix):
+                    # Replace the prefix
+                    dst_key = src_key_no_prefix.replace(ultralytics_prefix, our_prefix, 1)
+                    break
+            
+            # If no direct mapping found, try pattern-based conversion
+            if dst_key is None:
+                # Convert Ultralytics key format to our format
+                dst_key = src_key_no_prefix.replace('.bn.', '.norm.').replace('.cv1.', '.conv1.').replace('.cv2.', '.conv2.').replace('.cv3.', '.conv3.')
+            
+            # Check if this key exists in our model and has the same shape
+            if dst_key in dst_state_dict and src_value.shape == dst_state_dict[dst_key].shape:
+                new_state_dict[dst_key] = src_value
+                print(f"Successfully mapped {src_key} -> {dst_key}")
+            else:
+                print(f"Skipping {src_key} -> {dst_key} due to shape mismatch or missing key")
+        else:
+            # For keys that don't start with 'model.', check if they exist directly
+            if src_key in dst_state_dict and src_value.shape == dst_state_dict[src_key].shape:
+                new_state_dict[src_key] = src_value
+            else:
+                print(f"Skipping {src_key} due to shape mismatch or missing key")
+    
+    # Load the new state dict into the model
+    model.load_state_dict(new_state_dict, strict=False)
+    
+    return model
+
+
 def set_params(model, decay):
     p1 = []
     p2 = []

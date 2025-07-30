@@ -14,12 +14,15 @@ pip install tqdm
 ### Train
 
 * Configure your dataset path in `main.py` for training
-* Run `bash main.sh $ --train` for training, `$` is number of GPUs
+* Run `python main.py --train` for training
+* Run `python main.py --train --weights yolo11n.pt` for training with Ultralytics format pretrained weights
+* Run `python main.py --train --resume weights/last.pt` for resuming training from checkpoint
 
 ### Test
 
 * Configure your dataset path in `main.py` for testing
-* Run `python main.py --test` for testing
+* Run `python main.py --test` for testing with default weights
+* Run `python main.py --test --weights yolo11n.pt` for testing with Ultralytics format weights
 
 ### Results
 
