@@ -418,7 +418,7 @@ def non_max_suppression(pred, conf_th=0.001, iou_th=0.7):
     xc = pred[:, 4:(4 + nc)].amax(1) > conf_th
 
     start_time = time.time()
-    time_limit = 2.0 + 0.05 * bs
+    time_limit = 4.0 + 0.05 * bs
 
     pred = pred.transpose(-1, -2)
     pred[..., :4] = wh2xy(pred[..., :4])
@@ -645,17 +645,43 @@ def plot_mc_curve(px, py, save_dir, names, y, plot):
 
 
 def match_predictions(iou_v, pred, cls, iou):
-    correct = np.zeros((len(pred[:, 5]), len(iou_v)), dtype=bool)
-    iou = (iou * (cls[:, None] == pred[:, 5])).cpu().numpy()
-
-    for i, th in enumerate(iou_v.cpu().tolist()):
-        match = np.array(np.nonzero(iou >= th)).T
-        if match.size > 0:
-            match = match[iou[match[:, 0], match[:, 1]].argsort()[::-1]]
-            match = match[np.unique(match[:, 1], return_index=True)[1]]
-            match = match[np.unique(match[:, 0], return_index=True)[1]]
-            correct[match[:, 1].astype(int), i] = True
-    return torch.tensor(correct, dtype=torch.bool, device=pred[:, 5].device)
+    # Use PyTorch tensors throughout, avoid numpy conversion
+    device = pred.device
+    correct = torch.zeros((len(pred[:, 5]), len(iou_v)), dtype=torch.bool, device=device)
+    
+    # Keep everything on the same device, avoid cpu().numpy() conversion
+    iou = iou * (cls[:, None] == pred[:, 5])
+    
+    for i, th in enumerate(iou_v.tolist()):
+        # Find matches above threshold
+        match_matrix = iou >= th
+        
+        if match_matrix.any():
+            # Get all IoU values and coordinates where match_matrix is True
+            iou_values = iou[match_matrix]
+            row_idx, col_idx = torch.where(match_matrix)
+            
+            # Sort by IoU values in descending order
+            sorted_indices = torch.argsort(iou_values, descending=True)
+            row_idx = row_idx[sorted_indices]
+            col_idx = col_idx[sorted_indices]
+            
+            # Track used ground truth and prediction indices
+            used_gt = torch.zeros(iou.size(0), dtype=torch.bool, device=device)
+            used_pred = torch.zeros(iou.size(1), dtype=torch.bool, device=device)
+            
+            # Assign matches greedily (highest IoU first)
+            for j in range(len(row_idx)):
+                gt_idx = row_idx[j]
+                pred_idx = col_idx[j]
+                
+                # If neither ground truth nor prediction has been used
+                if not used_gt[gt_idx] and not used_pred[pred_idx]:
+                    correct[pred_idx, i] = True
+                    used_gt[gt_idx] = True
+                    used_pred[pred_idx] = True
+    
+    return correct
 
 
 # ----------------------------- Metrics & Plotting End -----------------------
@@ -719,7 +745,7 @@ def draw_box(im, box, index, label=""):
     return im
 
 
-def load_ultralytics_weight(model, ckpt_path):
+def load_ultralytics_weight(model, ckpt_path, verbose=False):
     """
     Load Ultralytics format weight file (like yolo11n.pt)
     
@@ -746,100 +772,107 @@ def load_ultralytics_weight(model, ckpt_path):
     # Create a detailed mapping from Ultralytics keys to our keys
     key_mapping = {
         # Backbone mappings
-        '0.conv': 'net.p1.0.conv',
-        '0.bn': 'net.p1.0.norm',
-        '1.conv': 'net.p2.0.conv',
-        '1.bn': 'net.p2.0.norm',
-        '2.cv1': 'net.p2.1.conv1',
-        '2.cv2': 'net.p2.1.conv2',
-        '2.m.0.cv1': 'net.p2.1.res_m.0.conv1',
-        '2.m.0.cv2': 'net.p2.1.res_m.0.conv2',
-        '3.conv': 'net.p3.0.conv',
-        '3.bn': 'net.p3.0.norm',
-        '4.cv1': 'net.p3.1.conv1',
-        '4.cv2': 'net.p3.1.conv2',
-        '4.m.0.cv1': 'net.p3.1.res_m.0.conv1',
-        '4.m.0.cv2': 'net.p3.1.res_m.0.conv2',
-        '5.conv': 'net.p4.0.conv',
-        '5.bn': 'net.p4.0.norm',
-        '6.cv1': 'net.p4.1.conv1',
-        '6.cv2': 'net.p4.1.conv2',
-        '6.m.0.cv1': 'net.p4.1.res_m.0.conv1',
-        '6.m.0.cv2': 'net.p4.1.res_m.0.conv2',
-        '6.m.0.cv3': 'net.p4.1.res_m.0.conv3',
-        '6.m.0.m.0.cv1': 'net.p4.1.res_m.0.m.0.conv1',
-        '6.m.0.m.0.cv2': 'net.p4.1.res_m.0.m.0.conv2',
-        '6.m.0.m.1.cv1': 'net.p4.1.res_m.0.m.1.conv1',
-        '6.m.0.m.1.cv2': 'net.p4.1.res_m.0.m.1.conv2',
-        '7.conv': 'net.p5.0.conv',
-        '7.bn': 'net.p5.0.norm',
-        '8.cv1': 'net.p5.1.conv1',
-        '8.cv2': 'net.p5.1.conv2',
-        '8.m.0.cv1': 'net.p5.1.res_m.0.conv1',
-        '8.m.0.cv2': 'net.p5.1.res_m.0.conv2',
-        '8.m.0.cv3': 'net.p5.1.res_m.0.conv3',
-        '8.m.0.m.0.cv1': 'net.p5.1.res_m.0.m.0.conv1',
-        '8.m.0.m.0.cv2': 'net.p5.1.res_m.0.m.0.conv2',
-        '8.m.0.m.1.cv1': 'net.p5.1.res_m.0.m.1.conv1',
-        '8.m.0.m.1.cv2': 'net.p5.1.res_m.0.m.1.conv2',
-        '9.cv1': 'net.p5.2.conv1',
-        '9.cv2': 'net.p5.2.conv2',
-        '10.cv1': 'net.p5.3.conv1',
-        '10.cv2': 'net.p5.3.conv2',
-        '10.m.0.attn.qkv': 'net.p5.3.m.0.attn.qkv',
-        '10.m.0.attn.proj': 'net.p5.3.m.0.attn.proj',
-        '10.m.0.attn.pe': 'net.p5.3.m.0.attn.pe',
-        '10.m.0.ffn.0': 'net.p5.3.m.0.ffn.0',
-        '10.m.0.ffn.1': 'net.p5.3.m.0.ffn.1',
+        '0.conv': 'backbone.p1.0.conv',
+        '0.bn': 'backbone.p1.0.norm',
+        '1.conv': 'backbone.p2.0.conv',
+        '1.bn': 'backbone.p2.0.norm',
+        '2.cv1': 'backbone.p2.1.conv1',
+        '2.cv2': 'backbone.p2.1.conv2',
+        '2.m.0.cv1': 'backbone.p2.1.res_m.0.conv1',
+        '2.m.0.cv2': 'backbone.p2.1.res_m.0.conv2',
+        '3.conv': 'backbone.p3.0.conv',
+        '3.bn': 'backbone.p3.0.norm',
+        '4.cv1': 'backbone.p3.1.conv1',
+        '4.cv2': 'backbone.p3.1.conv2',
+        '4.m.0.cv1': 'backbone.p3.1.res_m.0.conv1',
+        '4.m.0.cv2': 'backbone.p3.1.res_m.0.conv2',
+        '5.conv': 'backbone.p4.0.conv',
+        '5.bn': 'backbone.p4.0.norm',
+        '6.cv1': 'backbone.p4.1.conv1',
+        '6.cv2': 'backbone.p4.1.conv2',
+        '6.m.0.cv1': 'backbone.p4.1.res_m.0.conv1',
+        '6.m.0.cv2': 'backbone.p4.1.res_m.0.conv2',
+        '6.m.0.cv3': 'backbone.p4.1.res_m.0.conv3',
+        '6.m.0.m.0.cv1': 'backbone.p4.1.res_m.0.res_m.0.conv1',
+        '6.m.0.m.0.cv2': 'backbone.p4.1.res_m.0.res_m.0.conv2',
+        '6.m.0.m.1.cv1': 'backbone.p4.1.res_m.0.res_m.1.conv1',
+        '6.m.0.m.1.cv2': 'backbone.p4.1.res_m.0.res_m.1.conv2',
+        '7.conv': 'backbone.p5.0.conv',
+        '7.bn': 'backbone.p5.0.norm',
+        '8.cv1': 'backbone.p5.1.conv1',
+        '8.cv2': 'backbone.p5.1.conv2',
+        '8.m.0.cv1': 'backbone.p5.1.res_m.0.conv1',
+        '8.m.0.cv2': 'backbone.p5.1.res_m.0.conv2',
+        '8.m.0.cv3': 'backbone.p5.1.res_m.0.conv3',
+        '8.m.0.m.0.cv1': 'backbone.p5.1.res_m.0.res_m.0.conv1',
+        '8.m.0.m.0.cv2': 'backbone.p5.1.res_m.0.res_m.0.conv2',
+        '8.m.0.m.1.cv1': 'backbone.p5.1.res_m.0.res_m.1.conv1',
+        '8.m.0.m.1.cv2': 'backbone.p5.1.res_m.0.res_m.1.conv2',
+        '9.cv1': 'backbone.p5.2.conv1',
+        '9.cv2': 'backbone.p5.2.conv2',
+        '10.cv1': 'backbone.p5.3.conv1',
+        '10.cv2': 'backbone.p5.3.conv2',
+        '10.m.0.attn.qkv': 'backbone.p5.3.m.0.att.qkv_conv',
+        '10.m.0.attn.proj': 'backbone.p5.3.m.0.att.proj_conv',
+        '10.m.0.attn.pe': 'backbone.p5.3.m.0.att.pe_conv',
+        '10.m.0.ffn.0': 'backbone.p5.3.m.0.ffn.0',
+        '10.m.0.ffn.1': 'backbone.p5.3.m.0.ffn.1',
 
         # FPN mappings
-        '13.cv1': 'fpn.h1.conv1',
-        '13.cv2': 'fpn.h1.conv2',
-        '13.m.0.cv1': 'fpn.h1.res_m.0.conv1',
-        '13.m.0.cv2': 'fpn.h1.res_m.0.conv2',
-        '16.cv1': 'fpn.h2.conv1',
-        '16.cv2': 'fpn.h2.conv2',
-        '16.m.0.cv1': 'fpn.h2.res_m.0.conv1',
-        '16.m.0.cv2': 'fpn.h2.res_m.0.conv2',
-        '17.conv': 'fpn.h3.conv',
-        '17.bn': 'fpn.h3.norm',
-        '19.cv1': 'fpn.h4.conv1',
-        '19.cv2': 'fpn.h4.conv2',
-        '19.m.0.cv1': 'fpn.h4.res_m.0.conv1',
-        '19.m.0.cv2': 'fpn.h4.res_m.0.conv2',
-        '20.conv': 'fpn.h5.conv',
-        '20.bn': 'fpn.h5.norm',
-        '22.cv1': 'fpn.h6.conv1',
-        '22.cv2': 'fpn.h6.conv2',
-        '22.m.0.cv1': 'fpn.h6.res_m.0.conv1',
-        '22.m.0.cv2': 'fpn.h6.res_m.0.conv2',
+        '13.cv1': 'head.h1.conv1',
+        '13.cv2': 'head.h1.conv2',
+        '13.m.0.cv1': 'head.h1.res_m.0.conv1',
+        '13.m.0.cv2': 'head.h1.res_m.0.conv2',
+        '16.cv1': 'head.h2.conv1',
+        '16.cv2': 'head.h2.conv2',
+        '16.m.0.cv1': 'head.h2.res_m.0.conv1',
+        '16.m.0.cv2': 'head.h2.res_m.0.conv2',
+        '17.conv': 'head.h3.conv',
+        '17.bn': 'head.h3.norm',
+        '19.cv1': 'head.h4.conv1',
+        '19.cv2': 'head.h4.conv2',
+        '19.m.0.cv1': 'head.h4.res_m.0.conv1',
+        '19.m.0.cv2': 'head.h4.res_m.0.conv2',
+        '20.conv': 'head.h5.conv',
+        '20.bn': 'head.h5.norm',
+        '22.cv1': 'head.h6.conv1',
+        '22.cv2': 'head.h6.conv2',
+        '22.m.0.cv1': 'head.h6.res_m.0.conv1',
+        '22.m.0.cv2': 'head.h6.res_m.0.conv2',
+        '22.m.0.cv3': 'head.h6.res_m.0.conv3',
+        '22.m.0.m.0.cv1': 'head.h6.res_m.0.res_m.0.conv1',
+        '22.m.0.m.0.cv2': 'head.h6.res_m.0.res_m.0.conv2',
+        '22.m.0.m.1.cv1': 'head.h6.res_m.0.res_m.1.conv1',
+        '22.m.0.m.1.cv2': 'head.h6.res_m.0.res_m.1.conv2',
 
-        # Head mappings
-        '23.cv2.0.0': 'head.cls.0.0.conv',
-        '23.cv2.0.1': 'head.cls.0.1.conv',
-        '23.cv2.0.2': 'head.cls.0.2',
-        '23.cv2.1.0': 'head.cls.1.0.conv',
-        '23.cv2.1.1': 'head.cls.1.1.conv',
-        '23.cv2.1.2': 'head.cls.1.2',
-        '23.cv2.2.0': 'head.cls.2.0.conv',
-        '23.cv2.2.1': 'head.cls.2.1.conv',
-        '23.cv2.2.2': 'head.cls.2.2',
-        '23.cv3.0.0.0': 'head.box.0.0.conv',
-        '23.cv3.0.0.1': 'head.box.0.1.conv',
-        '23.cv3.0.1.0': 'head.box.0.2.conv',
-        '23.cv3.0.1.1': 'head.box.0.3.conv',
-        '23.cv3.0.2': 'head.box.0.4',
-        '23.cv3.1.0.0': 'head.box.1.0.conv',
-        '23.cv3.1.0.1': 'head.box.1.1.conv',
-        '23.cv3.1.1.0': 'head.box.1.2.conv',
-        '23.cv3.1.1.1': 'head.box.1.3.conv',
-        '23.cv3.1.2': 'head.box.1.4',
-        '23.cv3.2.0.0': 'head.box.2.0.conv',
-        '23.cv3.2.0.1': 'head.box.2.1.conv',
-        '23.cv3.2.1.0': 'head.box.2.2.conv',
-        '23.cv3.2.1.1': 'head.box.2.3.conv',
-        '23.cv3.2.2': 'head.box.2.4',
-        '23.dfl.conv': 'head.dfl.conv',
+        # Head mappings - Box regression layers (cv3 in Ultralytics corresponds to cls in our model due to structural differences)
+        '23.cv3.0.0.0': 'detect.cls.0.0.0',
+        '23.cv3.0.0.1': 'detect.cls.0.0.1',
+        '23.cv3.0.1.0': 'detect.cls.0.1.0',
+        '23.cv3.0.1.1': 'detect.cls.0.1.1',
+        '23.cv3.0.2': 'detect.cls.0.2',
+        '23.cv3.1.0.0': 'detect.cls.1.0.0',
+        '23.cv3.1.0.1': 'detect.cls.1.0.1',
+        '23.cv3.1.1.0': 'detect.cls.1.1.0',
+        '23.cv3.1.1.1': 'detect.cls.1.1.1',
+        '23.cv3.1.2': 'detect.cls.1.2',
+        '23.cv3.2.0.0': 'detect.cls.2.0.0',
+        '23.cv3.2.0.1': 'detect.cls.2.0.1',
+        '23.cv3.2.1.0': 'detect.cls.2.1.0',
+        '23.cv3.2.1.1': 'detect.cls.2.1.1',
+        '23.cv3.2.2': 'detect.cls.2.2',
+        
+        # Head mappings - Classification layers (cv2 in Ultralytics corresponds to box in our model due to structural differences)
+        '23.cv2.0.0': 'detect.box.0.0',
+        '23.cv2.0.1': 'detect.box.0.1',
+        '23.cv2.0.2': 'detect.box.0.2',
+        '23.cv2.1.0': 'detect.box.1.0',
+        '23.cv2.1.1': 'detect.box.1.1',
+        '23.cv2.1.2': 'detect.box.1.2',
+        '23.cv2.2.0': 'detect.box.2.0',
+        '23.cv2.2.1': 'detect.box.2.1',
+        '23.cv2.2.2': 'detect.box.2.2',
+        '23.dfl.conv': 'detect.dfl.conv',
     }
 
     # Map the keys from Ultralytics format to our format
@@ -862,21 +895,39 @@ def load_ultralytics_weight(model, ckpt_path):
                 # Convert Ultralytics key format to our format
                 dst_key = src_key_no_prefix.replace('.bn.', '.norm.').replace(
                     '.cv1.', '.conv1.').replace('.cv2.', '.conv2.').replace('.cv3.', '.conv3.')
+            else:
+                # Apply additional pattern replacements to the mapped key
+                # Handle special case for detection head layers
+                if 'detect' in dst_key:
+                    # For detection head, we need to be more careful about the mapping
+                    # Remove the trailing .conv part if it exists and will be duplicated
+                    if dst_key.endswith('.conv') and src_key_no_prefix.endswith('.conv'):
+                        # Don't add extra .conv
+                        pass
+                    else:
+                        dst_key = dst_key.replace('.bn.', '.norm.').replace(
+                            '.cv1.', '.conv1.').replace('.cv2.', '.conv2.').replace('.cv3.', '.conv3.')
+                else:
+                    dst_key = dst_key.replace('.bn.', '.norm.').replace(
+                        '.cv1.', '.conv1.').replace('.cv2.', '.conv2.').replace('.cv3.', '.conv3.')
 
             # Check if this key exists in our model and has the same shape
             if dst_key in dst_state_dict and src_value.shape == dst_state_dict[dst_key].shape:
                 new_state_dict[dst_key] = src_value
-                print(f"Successfully mapped {src_key} -> {dst_key}")
+                if verbose:
+                    print(f"Successfully mapped {src_key} -> {dst_key}")
             else:
-                print(
-                    f"Skipping {src_key} -> {dst_key} due to shape mismatch or missing key")
+                if verbose:
+                    print(
+                        f"Skipping {src_key} -> {dst_key} due to shape mismatch or missing key")
         else:
             # For keys that don't start with 'model.', check if they exist directly
             if src_key in dst_state_dict and src_value.shape == dst_state_dict[src_key].shape:
                 new_state_dict[src_key] = src_value
             else:
-                print(
-                    f"Skipping {src_key} due to shape mismatch or missing key")
+                if verbose:
+                    print(
+                        f"Skipping {src_key} due to shape mismatch or missing key")
 
     # Load the new state dict into the model
     model.load_state_dict(new_state_dict, strict=False)
@@ -901,3 +952,94 @@ def set_params(model, decay):
                 p2.append(p)  # weight (with decay)
     return [{'params': p1, 'weight_decay': 0.00},
             {'params': p2, 'weight_decay': decay}]
+
+
+# ----------------------------- Checkpoint Utilities -------------------------
+def save_checkpoint(epoch, model, optimizer, scheduler, scaler, ema, best_map, filename):
+    """
+    Save complete training state to checkpoint file
+    
+    Args:
+        epoch: Current epoch number
+        model: Model object (typically EMA model for best/last checkpoints)
+        optimizer: Optimizer object
+        scheduler: Learning rate scheduler object
+        scaler: Gradient scaler object
+        ema: EMA object
+        best_map: Best mAP achieved so far
+        filename: Path to save checkpoint
+    """
+    state = {
+        'epoch': epoch,
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict() if optimizer else None,
+        'scheduler': scheduler.state_dict() if scheduler else None,
+        'scaler': scaler.state_dict() if scaler else None,
+        'ema': ema.ema.state_dict() if ema else None,
+        'best_map': best_map,
+        'model_config': {
+            'nc': model.detect.nc if hasattr(model, 'detect') else 0,
+            'reg_max': model.detect.reg_max if hasattr(model, 'detect') else 16,
+            'stride': model.stride if hasattr(model, 'stride') else None
+        }
+    }
+    
+    # Add EMA attributes if available
+    if ema:
+        state['ema_updates'] = ema.updates
+    
+    torch.save(state, filename)
+    print(f"Checkpoint saved to {filename}")
+
+
+def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None, scaler=None, ema=None, device=None):
+    """
+    Load complete training state from checkpoint file
+    
+    Args:
+        checkpoint_path: Path to checkpoint file
+        model: Model object to load weights into
+        optimizer: Optimizer object (optional)
+        scheduler: Learning rate scheduler object (optional)
+        scaler: Gradient scaler object (optional)
+        ema: EMA object (optional)
+        device: Device to load checkpoint to
+        
+    Returns:
+        checkpoint: Loaded checkpoint dictionary
+        start_epoch: Epoch to resume from
+        best_map: Best mAP from checkpoint
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+    
+    print(f"Loading checkpoint from {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Load model state
+    if 'model' in checkpoint:
+        model.load_state_dict(checkpoint['model'])
+    
+    # Load optimizer state if provided
+    if optimizer and 'optimizer' in checkpoint and checkpoint['optimizer'] is not None:
+        optimizer.load_state_dict(checkpoint['optimizer'])
+    
+    # Load scheduler state if provided
+    if scheduler and 'scheduler' in checkpoint and checkpoint['scheduler'] is not None:
+        scheduler.load_state_dict(checkpoint['scheduler'])
+    
+    # Load scaler state if provided
+    if scaler and 'scaler' in checkpoint and checkpoint['scaler'] is not None:
+        scaler.load_state_dict(checkpoint['scaler'])
+    
+    # Load EMA state if provided
+    if ema and 'ema' in checkpoint and checkpoint['ema'] is not None:
+        ema.ema.load_state_dict(checkpoint['ema'])
+        if 'ema_updates' in checkpoint:
+            ema.updates = checkpoint['ema_updates']
+    
+    start_epoch = checkpoint.get('epoch', 0) + 1  # Resume from next epoch
+    best_map = checkpoint.get('best_map', 0.0)
+    
+    print(f"Checkpoint loaded. Resuming from epoch {start_epoch}")
+    return checkpoint, start_epoch, best_map

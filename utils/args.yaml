@@ -2,7 +2,7 @@ buffer: True # if dataset is large buffer should be True, otherwise False
 psp: 0.0000
 translate: 0.100000
 degree: 0.000000000
-mosaic: 1.000000000
+mosaic: 1.0000000000
 mixup: 0.0000000000
 scale: 0.5000000000
 shear: 0.0000000000
@@ -16,6 +16,17 @@ decay: 0.0005
 box: 7.50000000000000
 cls: 0.500000000000
 dfl: 1.5000000000
+
+# Checkpoint configuration
+checkpoint_dir: "weights"
+checkpoint_freq: 1  # Save checkpoint every N epochs
+save_best: True     # Save best model based on mAP
+save_last: True     # Save last model
+
+# Batch error tolerance configuration
+enable_error_tolerance: True  # Enable batch error tolerance mechanism
+max_consecutive_errors: 10    # Maximum consecutive errors before stopping
+error_log_file: "weights/error_batches.log"  # File to log error batches
 
 
 names:
