@@ -1,59 +1,49 @@
-YOLOv11 re-implementation using PyTorch
+# YOLOv11 Next-Gen Object Detection using PyTorch
 
-### Installation
+### _Achieve SOTA results with just 1 line of code!_
+# 🚀 Demo
+
+output.mp4
+
+
+### ⚡ Installation (30 Seconds Setup)
 
 ```
-conda create -n YOLO python=3.10.10
+conda create -n YOLO python=3.9
 conda activate YOLO
-conda install pytorch torchvision torchaudio pytorch-cuda=12.1 -c pytorch -c nvidia
-pip install opencv-python
-pip install PyYAML
+pip install thop
 pip install tqdm
+pip install PyYAML
+pip install opencv-python
+conda install pytorch torchvision torchaudio cudatoolkit=10.2 -c pytorch-lts
 ```
 
-### Train
+### 🏋 Train
 
 * Configure your dataset path in `main.py` for training
 * Run `python main.py --train` for training
-* Run `python main.py --train --weights yolo11n.pt` for training with Ultralytics format pretrained weights
-* Run `python main.py --train --resume weights/last.pt` for resuming training from checkpoint
 
-### Test
+### 🧪 Test/Validate
 
 * Configure your dataset path in `main.py` for testing
-* Run `python main.py --test` for testing with default weights
-* Run `python main.py --test --weights yolo11n.pt` for testing with Ultralytics format weights
+* Run `python main.py --Validate` for validation
 
-### Results
+### 🔍 Inference (Webcam or Video)
 
-| Version | Epochs | Box mAP |                                                                              Download |
-|:-------:|:------:|--------:|--------------------------------------------------------------------------------------:|
-|  v11_n  |  600   |    38.6 |                                                            [Model](./weights/best.pt) |
-| v11_n*  |   -    |    39.2 | [Model](https://github.com/jahongir7174/YOLOv11-pt/releases/download/v0.0.1/v11_n.pt) |
-| v11_s*  |   -    |    46.5 | [Model](https://github.com/jahongir7174/YOLOv11-pt/releases/download/v0.0.1/v11_s.pt) |
-| v11_m*  |   -    |    51.2 | [Model](https://github.com/jahongir7174/YOLOv11-pt/releases/download/v0.0.1/v11_m.pt) |
-| v11_l*  |   -    |    53.0 | [Model](https://github.com/jahongir7174/YOLOv11-pt/releases/download/v0.0.1/v11_l.pt) |
-| v11_x*  |   -    |    54.3 | [Model](https://github.com/jahongir7174/YOLOv11-pt/releases/download/v0.0.1/v11_x.pt) |
+* Run `python main.py --inference` for inference
 
-```
- Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.386
- Average Precision  (AP) @[ IoU=0.50      | area=   all | maxDets=100 ] = 0.551
- Average Precision  (AP) @[ IoU=0.75      | area=   all | maxDets=100 ] = 0.415
- Average Precision  (AP) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.196
- Average Precision  (AP) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.420
- Average Precision  (AP) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.569
- Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=  1 ] = 0.321
- Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets= 10 ] = 0.533
- Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.588
- Average Recall     (AR) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.361
- Average Recall     (AR) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.646
- Average Recall     (AR) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.777
-```
+### 📊 Performance Metrics & Pretrained Checkpoints
 
-* `*` means that it is from original repository, see reference
-* In the official YOLOv11 code, mask annotation information is used, which leads to higher performance
+| Model                                                                                | mAP<sup>val<br>50-95 | mAP<sup>val<br>50 | params<br><sup>(M) | FLOPs<br><sup>@640 (B) |
+|--------------------------------------------------------------------------------------|----------------------|-------------------|--------------------|------------------------|
+| [YOLOv11n](https://github.com/Shohruh72/YOLOv11/releases/download/v1.0.0/v11_n.pt) | 39.5                 | 54.8              | **2.6**            | **6.5**                |
+| [YOLOv11s](https://github.com/Shohruh72/YOLOv11/releases/download/v1.0.0/v11_s.pt) | 47.0                 | 63.5              | 9.4                | 21.5                   |
+| [YOLOv11m](https://github.com/Shohruh72/YOLOv11/releases/download/v1.0.0/v11_m.pt) | 51.5                 | 68.1              | 20.1               | 68.0                   |
+| [YOLOv11l](https://github.com/Shohruh72/YOLOv11/releases/download/v1.0.0/v11_l.pt) | 53.4                 | 69.7              | 25.3               | 86.9                   | 50.7                 | 68.9              | 86.7               | 205.7                  |
+| [YOLOv11x](https://github.com/Shohruh72/YOLOv11/releases/download/v1.0.0/v11_x.pt) | 54.9                 | 71.3              | 56.9               | 194.9                  | 50.7                 | 68.9              | 86.7               | 205.7                  |
 
-### Dataset structure
+### 📈 Additional Metrics
+### 📂 Dataset structure
 
     ├── COCO 
         ├── images
@@ -71,7 +61,12 @@ pip install tqdm
                 ├── 1111.txt
                 ├── 2222.txt
 
-#### Reference
+⭐ Star the Repo!
+
+If you find this project helpful, give us a star ⭐ 
+
+#### 🔗 Reference
 
 * https://github.com/ultralytics/ultralytics
-* https://github.com/jahongir7174/YOLOv8-pt
+* https://github.com/Shohruh72/YOLOv11
+# YOLOv11

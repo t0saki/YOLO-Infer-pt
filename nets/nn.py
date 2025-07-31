@@ -1,8 +1,7 @@
 import math
-
 import torch
-
-from utils.util import make_anchors
+import torch.nn as nn
+from utils import util
 
 
 def fuse_conv(conv, norm):
@@ -12,49 +11,74 @@ def fuse_conv(conv, norm):
                                  stride=conv.stride,
                                  padding=conv.padding,
                                  groups=conv.groups,
-                                 bias=True).requires_grad_(False).to(conv.weight.device)
+                                 bias=True).requires_grad_(False).to(
+        conv.weight.device)
 
     w_conv = conv.weight.clone().view(conv.out_channels, -1)
-    w_norm = torch.diag(norm.weight.div(torch.sqrt(norm.eps + norm.running_var)))
-    fused_conv.weight.copy_(torch.mm(w_norm, w_conv).view(fused_conv.weight.size()))
+    w_norm = torch.diag(
+        norm.weight.div(torch.sqrt(norm.eps + norm.running_var)))
+    fused_conv.weight.copy_(
+        torch.mm(w_norm, w_conv).view(fused_conv.weight.size()))
 
-    b_conv = torch.zeros(conv.weight.size(0), device=conv.weight.device) if conv.bias is None else conv.bias
-    b_norm = norm.bias - norm.weight.mul(norm.running_mean).div(torch.sqrt(norm.running_var + norm.eps))
-    fused_conv.bias.copy_(torch.mm(w_norm, b_conv.reshape(-1, 1)).reshape(-1) + b_norm)
+    b_conv = torch.zeros(conv.weight.size(0),
+                         device=conv.weight.device) if conv.bias is None else conv.bias
+    b_norm = norm.bias - norm.weight.mul(norm.running_mean).div(
+        torch.sqrt(norm.running_var + norm.eps))
+    fused_conv.bias.copy_(
+        torch.mm(w_norm, b_conv.reshape(-1, 1)).reshape(-1) + b_norm)
 
     return fused_conv
 
 
-class Conv(torch.nn.Module):
-    def __init__(self, in_ch, out_ch, activation, k=1, s=1, p=0, g=1):
+class Concat(nn.Module):
+    """Concatenate a list of tensors along dimension."""
+
+    def __init__(self, dimension=1):
+        """Concatenates a list of tensors along a specified dimension."""
         super().__init__()
-        self.conv = torch.nn.Conv2d(in_ch, out_ch, k, s, p, groups=g, bias=False)
-        self.norm = torch.nn.BatchNorm2d(out_ch, eps=0.001, momentum=0.03)
-        self.relu = activation
+        self.d = dimension
 
     def forward(self, x):
-        return self.relu(self.norm(self.conv(x)))
-
-    def fuse_forward(self, x):
-        return self.relu(self.conv(x))
+        """Forward pass for the YOLOv8 mask Proto module."""
+        return torch.cat(x, self.d)
 
 
-class Residual(torch.nn.Module):
-    def __init__(self, ch, e=0.5):
+class Conv(nn.Module):
+    def __init__(self, inp, oup, k=1, s=1, p=None, g=1, d=1, act=True):
         super().__init__()
-        self.conv1 = Conv(ch, int(ch * e), torch.nn.SiLU(), k=3, p=1)
-        self.conv2 = Conv(int(ch * e), ch, torch.nn.SiLU(), k=3, p=1)
+        self.conv = nn.Conv2d(inp, oup, k, s, self._pad(k, p), d, g, False)
+        self.norm = nn.BatchNorm2d(oup)
+        self.act = nn.SiLU(inplace=True) if act is True else nn.Identity()
+
+    def forward(self, x):
+        return self.act(self.norm(self.conv(x)))
+
+    def forward_fuse(self, x):
+        return self.act(self.conv(x))
+
+    @staticmethod
+    def _pad(k, p=None):
+        if p is None:
+            p = k // 2 if isinstance(k, int) else [x // 2 for x in k]
+        return p
+
+
+class Residual(nn.Module):
+    def __init__(self, inp, g=1, k=(3, 3), e=0.5):
+        super().__init__()
+        self.conv1 = Conv(inp, int(inp * e), k[0], 1)
+        self.conv2 = Conv(int(inp * e), inp, k[1], 1, g=g)
 
     def forward(self, x):
         return x + self.conv2(self.conv1(x))
 
 
-class CSPModule(torch.nn.Module):
+class CSPBlock(torch.nn.Module):
     def __init__(self, in_ch, out_ch):
         super().__init__()
-        self.conv1 = Conv(in_ch, out_ch // 2, torch.nn.SiLU())
-        self.conv2 = Conv(in_ch, out_ch // 2, torch.nn.SiLU())
-        self.conv3 = Conv(2 * (out_ch // 2), out_ch, torch.nn.SiLU())
+        self.conv1 = Conv(in_ch, out_ch // 2)
+        self.conv2 = Conv(in_ch, out_ch // 2)
+        self.conv3 = Conv(2 * (out_ch // 2), out_ch)
         self.res_m = torch.nn.Sequential(Residual(out_ch // 2, e=1.0),
                                          Residual(out_ch // 2, e=1.0))
 
@@ -64,15 +88,17 @@ class CSPModule(torch.nn.Module):
 
 
 class CSP(torch.nn.Module):
-    def __init__(self, in_ch, out_ch, n, csp, r):
+    def __init__(self, in_ch, out_ch, n, csp, r=2):
         super().__init__()
-        self.conv1 = Conv(in_ch, 2 * (out_ch // r), torch.nn.SiLU())
-        self.conv2 = Conv((2 + n) * (out_ch // r), out_ch, torch.nn.SiLU())
+        self.conv1 = Conv(in_ch, 2 * (out_ch // r))
+        self.conv2 = Conv((2 + n) * (out_ch // r), out_ch)
 
         if not csp:
-            self.res_m = torch.nn.ModuleList(Residual(out_ch // r) for _ in range(n))
+            self.res_m = torch.nn.ModuleList(
+                Residual(out_ch // r) for _ in range(n))
         else:
-            self.res_m = torch.nn.ModuleList(CSPModule(out_ch // r, out_ch // r) for _ in range(n))
+            self.res_m = torch.nn.ModuleList(
+                CSPBlock(out_ch // r, out_ch // r) for _ in range(n))
 
     def forward(self, x):
         y = list(self.conv1(x).chunk(2, 1))
@@ -80,105 +106,182 @@ class CSP(torch.nn.Module):
         return self.conv2(torch.cat(y, dim=1))
 
 
-class SPP(torch.nn.Module):
-    def __init__(self, in_ch, out_ch, k=5):
+class SPP(nn.Module):
+    def __init__(self, inp, k=5):
         super().__init__()
-        self.conv1 = Conv(in_ch, in_ch // 2, torch.nn.SiLU())
-        self.conv2 = Conv(in_ch * 2, out_ch, torch.nn.SiLU())
-        self.res_m = torch.nn.MaxPool2d(k, stride=1, padding=k // 2)
+        self.conv1 = Conv(inp, inp // 2, 1, 1)
+        self.conv2 = Conv(inp // 2 * 4, inp, 1, 1)
+        self.m = nn.MaxPool2d(k, stride=1, padding=k // 2)
 
     def forward(self, x):
-        x = self.conv1(x)
-        y1 = self.res_m(x)
-        y2 = self.res_m(y1)
-        return self.conv2(torch.cat(tensors=[x, y1, y2, self.res_m(y2)], dim=1))
+        y = [self.conv1(x)]
+        y.extend(self.m(y[-1]) for _ in range(3))
+        return self.conv2(torch.cat(y, 1))
 
 
-class Attention(torch.nn.Module):
-
-    def __init__(self, ch, num_head):
+class Attention(nn.Module):
+    def __init__(self, dim, num_head=8):
         super().__init__()
         self.num_head = num_head
-        self.dim_head = ch // num_head
-        self.dim_key = self.dim_head // 2
-        self.scale = self.dim_key ** -0.5
+        self.head_dim = dim // num_head
+        self.key_dim = self.head_dim // 2
+        self.scale = self.key_dim ** -0.5
+        h = dim + self.key_dim * num_head * 2
 
-        self.qkv = Conv(ch, ch + self.dim_key * num_head * 2, torch.nn.Identity())
+        # Convolution for query, key, and value
+        self.qkv_conv = Conv(dim, h, 1, act=False)
 
-        self.conv1 = Conv(ch, ch, torch.nn.Identity(), k=3, p=1, g=ch)
-        self.conv2 = Conv(ch, ch, torch.nn.Identity())
+        # Projection and Positional encoding convolution
+        self.proj_conv = Conv(dim, dim, 1, act=False)
+        self.pe_conv = Conv(dim, dim, 3, g=dim, act=False)
 
     def forward(self, x):
-        b, c, h, w = x.shape
+        b, ch, h, w = x.shape
 
-        qkv = self.qkv(x)
-        qkv = qkv.view(b, self.num_head, self.dim_key * 2 + self.dim_head, h * w)
+        qkv = self.qkv_conv(x)
+        qkv = qkv.view(b, self.num_head, self.key_dim * 2 + self.head_dim,
+                       h * w)
+        q, k, v = qkv.split([self.key_dim, self.key_dim, self.head_dim], dim=2)
+        attn = ((q.transpose(-2, -1) @ k) * self.scale).softmax(dim=-1)
+        out = (v @ attn.transpose(-2, -1)).view(b, ch, h, w)
 
-        q, k, v = qkv.split([self.dim_key, self.dim_key, self.dim_head], dim=2)
-
-        attn = (q.transpose(-2, -1) @ k) * self.scale
-        attn = attn.softmax(dim=-1)
-
-        x = (v @ attn.transpose(-2, -1)).view(b, c, h, w) + self.conv1(v.reshape(b, c, h, w))
-        return self.conv2(x)
+        return self.proj_conv(out + self.pe_conv(v.reshape(b, ch, h, w)))
 
 
-class PSABlock(torch.nn.Module):
-
-    def __init__(self, ch, num_head):
+class PSABlock(nn.Module):
+    def __init__(self, inp, num_head=4):
         super().__init__()
-        self.conv1 = Attention(ch, num_head)
-        self.conv2 = torch.nn.Sequential(Conv(ch, ch * 2, torch.nn.SiLU()),
-                                         Conv(ch * 2, ch, torch.nn.Identity()))
+        self.att = Attention(inp, num_head)
+        self.ffn = nn.Sequential(Conv(inp, inp * 2, 1),
+                                 Conv(inp * 2, inp, 1, act=False))
 
     def forward(self, x):
-        x = x + self.conv1(x)
-        return x + self.conv2(x)
+        x = x + self.att(x)
+        return x + self.ffn(x)
 
 
-class PSA(torch.nn.Module):
-    def __init__(self, ch, n):
+class PSA(nn.Module):
+    def __init__(self, inp, oup, n=1):
         super().__init__()
-        self.conv1 = Conv(ch, 2 * (ch // 2), torch.nn.SiLU())
-        self.conv2 = Conv(2 * (ch // 2), ch, torch.nn.SiLU())
-        self.res_m = torch.nn.Sequential(*(PSABlock(ch // 2, ch // 128) for _ in range(n)))
+        assert inp == oup
+        self.conv1 = Conv(inp, 2 * (inp // 2))
+        self.conv2 = Conv(2 * (inp // 2), inp)
+
+        self.m = nn.Sequential(
+            *(PSABlock(inp // 2, inp // 128) for _ in range(n)))
 
     def forward(self, x):
-        x, y = self.conv1(x).chunk(2, 1)
-        return self.conv2(torch.cat(tensors=(x, self.res_m(y)), dim=1))
+        a, b = self.conv1(x).chunk(2, 1)
+        return self.conv2(torch.cat((a, self.m(b)), 1))
 
 
-class DarkNet(torch.nn.Module):
+class DWConv(Conv):
+    def __init__(self, inp, oup, k=1, s=1, d=1, act=True):
+        super().__init__(inp, oup, k, s, g=math.gcd(inp, oup), d=d, act=act)
+
+
+class DFL(nn.Module):
+    def __init__(self, inp=16):
+        super().__init__()
+        self.inp = inp
+        self.conv = nn.Conv2d(inp, 1, 1, bias=False).requires_grad_(False)
+        x = torch.arange(inp, dtype=torch.float).view(1, inp, 1, 1)
+        self.conv.weight.data[:] = nn.Parameter(x)
+
+    def forward(self, x):
+        b, _, a = x.shape
+        out = x.view(b, 4, self.inp, a).transpose(2, 1)
+        return self.conv(out.softmax(1)).view(b, 4, a)
+
+
+class Detect(nn.Module):
+    anchors = torch.empty(0)
+    strides = torch.empty(0)
+
+    def __init__(self, nc=80, filters=()):
+        super().__init__()
+        self.nc = nc
+        self.reg_max = 16
+        self.nl = len(filters)
+        self.no = nc + self.reg_max * 4
+        self.stride = torch.zeros(self.nl)
+
+        box = max((filters[0] // 4, 64))
+        cls = max(filters[0], min(self.nc, 100))
+
+        self.box = nn.ModuleList(
+            nn.Sequential(Conv(x, box, 3), Conv(box, box, 3),
+                          nn.Conv2d(box, 4 * self.reg_max, 1)) for x in
+            filters)
+
+        self.cls = nn.ModuleList(
+            nn.Sequential(nn.Sequential(DWConv(x, x, 3), Conv(x, cls, 1)),
+                          nn.Sequential(DWConv(cls, cls, 3),
+                                        Conv(cls, cls, 1)),
+                          nn.Conv2d(cls, self.nc, 1), ) for x in filters)
+        self.dfl = DFL(self.reg_max)
+
+    def forward(self, x):
+        for i in range(self.nl):
+            box_out = self.box[i](x[i])
+            cls_out = self.cls[i](x[i])
+            x[i] = torch.cat((box_out, cls_out), 1)
+
+        if self.training:
+            return x
+
+        bs = x[0].shape
+        x_cat = torch.cat([xi.view(bs[0], self.no, -1) for xi in x], 2)
+        self.anchors, self.strides = (j.transpose(0, 1) for j in
+                                      util.make_anchors(x, self.stride))
+        box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
+        lt, rb = self.dfl(box).chunk(2, 1)
+        x1y1 = self.anchors.unsqueeze(0) - lt
+        x2y2 = self.anchors.unsqueeze(0) + rb
+        c_xy, wh = (x1y1 + x2y2) / 2, x2y2 - x1y1
+        d_box = torch.cat((c_xy, wh), 1)
+
+        output = torch.cat((d_box * self.strides, cls.sigmoid()), 1)
+        return output, x
+
+    def bias_init(self):
+        m = self
+        for a, b, s in zip(m.box, m.cls, m.stride):
+            a[-1].bias.data[:] = 1.0
+            b[-1].bias.data[: m.nc] = math.log(5 / m.nc / (640 / s) ** 2)
+
+
+class Backbone(nn.Module):
     def __init__(self, width, depth, csp):
         super().__init__()
+
         self.p1 = []
         self.p2 = []
         self.p3 = []
         self.p4 = []
         self.p5 = []
 
-        # p1/2
-        self.p1.append(Conv(width[0], width[1], torch.nn.SiLU(), k=3, s=2, p=1))
-        # p2/4
-        self.p2.append(Conv(width[1], width[2], torch.nn.SiLU(), k=3, s=2, p=1))
-        self.p2.append(CSP(width[2], width[3], depth[0], csp[0], r=4))
-        # p3/8
-        self.p3.append(Conv(width[3], width[3], torch.nn.SiLU(), k=3, s=2, p=1))
-        self.p3.append(CSP(width[3], width[4], depth[1], csp[0], r=4))
-        # p4/16
-        self.p4.append(Conv(width[4], width[4], torch.nn.SiLU(), k=3, s=2, p=1))
-        self.p4.append(CSP(width[4], width[4], depth[2], csp[1], r=2))
-        # p5/32
-        self.p5.append(Conv(width[4], width[5], torch.nn.SiLU(), k=3, s=2, p=1))
-        self.p5.append(CSP(width[5], width[5], depth[3], csp[1], r=2))
-        self.p5.append(SPP(width[5], width[5]))
-        self.p5.append(PSA(width[5], depth[4]))
+        self.p1.append(Conv(width[0], width[1], 3, 2))
 
-        self.p1 = torch.nn.Sequential(*self.p1)
-        self.p2 = torch.nn.Sequential(*self.p2)
-        self.p3 = torch.nn.Sequential(*self.p3)
-        self.p4 = torch.nn.Sequential(*self.p4)
-        self.p5 = torch.nn.Sequential(*self.p5)
+        self.p2.append(Conv(width[1], width[2], 3, 2))
+        self.p2.append(CSP(width[2], width[3], depth[0], csp[0], 4))
+
+        self.p3.append(Conv(width[3], width[3], 3, 2))
+        self.p3.append(CSP(width[3], width[4], depth[1], csp[0], 4))
+
+        self.p4.append(Conv(width[4], width[4], 3, 2))
+        self.p4.append(CSP(width[4], width[4], depth[2], csp[1]))
+
+        self.p5.append(Conv(width[4], width[5], 3, 2))
+        self.p5.append(CSP(width[5], width[5], depth[3], csp[1]))
+        self.p5.append(SPP(width[5], 5))
+        self.p5.append(PSA(width[5], width[5], depth[4]))
+
+        self.p1 = nn.Sequential(*self.p1)
+        self.p2 = nn.Sequential(*self.p2)
+        self.p3 = nn.Sequential(*self.p3)
+        self.p4 = nn.Sequential(*self.p4)
+        self.p5 = nn.Sequential(*self.p5)
 
     def forward(self, x):
         p1 = self.p1(x)
@@ -189,159 +292,106 @@ class DarkNet(torch.nn.Module):
         return p3, p4, p5
 
 
-class DarkFPN(torch.nn.Module):
+class Head(nn.Module):
     def __init__(self, width, depth, csp):
         super().__init__()
-        self.up = torch.nn.Upsample(scale_factor=2)
-        self.h1 = CSP(width[4] + width[5], width[4], depth[5], csp[0], r=2)
-        self.h2 = CSP(width[4] + width[4], width[3], depth[5], csp[0], r=2)
-        self.h3 = Conv(width[3], width[3], torch.nn.SiLU(), k=3, s=2, p=1)
-        self.h4 = CSP(width[3] + width[4], width[4], depth[5], csp[0], r=2)
-        self.h5 = Conv(width[4], width[4], torch.nn.SiLU(), k=3, s=2, p=1)
-        self.h6 = CSP(width[4] + width[5], width[5], depth[5], csp[1], r=2)
+        self.up = nn.Upsample(scale_factor=2, mode='nearest')
+        self.concat = Concat()
+
+        self.h1 = CSP(width[4] + width[5], width[4], depth[0], csp[0])
+
+        self.h2 = CSP(width[4] + width[4], width[3], depth[0], csp[0])
+
+        self.h3 = Conv(width[3], width[3], 3, 2, 1)
+        self.h4 = CSP(width[3] + width[4], width[4], depth[0], csp[0])
+
+        self.h5 = Conv(width[4], width[4], 3, 2, 1)
+        self.h6 = CSP(width[4] + width[5], width[5], depth[0], csp[1])
+
+        # self.detect = Detect(80, (width[3], width[4], width[5]))
 
     def forward(self, x):
         p3, p4, p5 = x
-        p4 = self.h1(torch.cat(tensors=[self.up(p5), p4], dim=1))
-        p3 = self.h2(torch.cat(tensors=[self.up(p4), p3], dim=1))
-        p4 = self.h4(torch.cat(tensors=[self.h3(p3), p4], dim=1))
-        p5 = self.h6(torch.cat(tensors=[self.h5(p4), p5], dim=1))
-        return p3, p4, p5
+        h1 = self.h1(self.concat([self.up(p5), p4]))
+        h2 = self.h2(self.concat([self.up(h1), p3]))
+        h4 = self.h4(self.concat([self.h3(h2), h1]))
+        h6 = self.h6(self.concat([self.h5(h4), p5]))
+        return h2, h4, h6
 
 
-class DFL(torch.nn.Module):
-    # Generalized Focal Loss
-    # https://ieeexplore.ieee.org/document/9792391
-    def __init__(self, ch=16):
-        super().__init__()
-        self.ch = ch
-        self.conv = torch.nn.Conv2d(ch, out_channels=1, kernel_size=1, bias=False).requires_grad_(False)
-        x = torch.arange(ch, dtype=torch.float).view(1, ch, 1, 1)
-        self.conv.weight.data[:] = torch.nn.Parameter(x)
-
-    def forward(self, x):
-        b, c, a = x.shape
-        x = x.view(b, 4, self.ch, a).transpose(2, 1)
-        return self.conv(x.softmax(1)).view(b, 4, a)
-
-
-class Head(torch.nn.Module):
-    anchors = torch.empty(0)
-    strides = torch.empty(0)
-
-    def __init__(self, nc=80, filters=()):
-        super().__init__()
-        self.ch = 16  # DFL channels
-        self.nc = nc  # number of classes
-        self.nl = len(filters)  # number of detection layers
-        self.no = nc + self.ch * 4  # number of outputs per anchor
-        self.stride = torch.zeros(self.nl)  # strides computed during build
-
-        box = max(64, filters[0] // 4)
-        cls = max(80, filters[0], self.nc)
-
-        self.dfl = DFL(self.ch)
-        self.box = torch.nn.ModuleList(torch.nn.Sequential(Conv(x, box,torch.nn.SiLU(), k=3, p=1),
-                                                           Conv(box, box,torch.nn.SiLU(), k=3, p=1),
-                                                           torch.nn.Conv2d(box, out_channels=4 * self.ch,
-                                                                           kernel_size=1)) for x in filters)
-        self.cls = torch.nn.ModuleList(torch.nn.Sequential(Conv(x, x, torch.nn.SiLU(), k=3, p=1, g=x),
-                                                           Conv(x, cls, torch.nn.SiLU()),
-                                                           Conv(cls, cls, torch.nn.SiLU(), k=3, p=1, g=cls),
-                                                           Conv(cls, cls, torch.nn.SiLU()),
-                                                           torch.nn.Conv2d(cls, out_channels=self.nc,
-                                                                           kernel_size=1)) for x in filters)
-
-    def forward(self, x):
-        for i, (box, cls) in enumerate(zip(self.box, self.cls)):
-            x[i] = torch.cat(tensors=(box(x[i]), cls(x[i])), dim=1)
-        if self.training:
-            return x
-
-        self.anchors, self.strides = (i.transpose(0, 1) for i in make_anchors(x, self.stride))
-        x = torch.cat([i.view(x[0].shape[0], self.no, -1) for i in x], dim=2)
-        box, cls = x.split(split_size=(4 * self.ch, self.nc), dim=1)
-
-        a, b = self.dfl(box).chunk(2, 1)
-        a = self.anchors.unsqueeze(0) - a
-        b = self.anchors.unsqueeze(0) + b
-        box = torch.cat(tensors=((a + b) / 2, b - a), dim=1)
-
-        return torch.cat(tensors=(box * self.strides, cls.sigmoid()), dim=1)
-
-    def initialize_biases(self):
-        # Initialize biases
-        # WARNING: requires stride availability
-        for box, cls, s in zip(self.box, self.cls, self.stride):
-            # box
-            box[-1].bias.data[:] = 1.0
-            # cls (.01 objects, 80 classes, 640 image)
-            cls[-1].bias.data[:self.nc] = math.log(5 / self.nc / (640 / s) ** 2)
+def initialize_weights(model):
+    for m in model.modules():
+        t = type(m)
+        if t is nn.Conv2d:
+            pass
+        elif t is nn.BatchNorm2d:
+            m.eps = 1e-3
+            m.momentum = 0.03
+        elif t in {nn.Hardswish, nn.LeakyReLU, nn.ReLU, nn.ReLU6, nn.SiLU}:
+            m.inplace = True
 
 
 class YOLO(torch.nn.Module):
-    def __init__(self, width, depth, csp, num_classes):
+    def __init__(self, num_cls, width, depth, csp):
         super().__init__()
-        self.net = DarkNet(width, depth, csp)
-        self.fpn = DarkFPN(width, depth, csp)
+        self.backbone = Backbone(width, depth, csp)
+        self.head = Head(width, depth, csp)
 
         img_dummy = torch.zeros(1, width[0], 256, 256)
-        self.head = Head(num_classes, (width[3], width[4], width[5]))
-        self.head.stride = torch.tensor([256 / x.shape[-2] for x in self.forward(img_dummy)])
-        self.stride = self.head.stride
-        self.head.initialize_biases()
+        self.detect = Detect(num_cls, (width[3], width[4], width[5]))
+        self.detect.stride = torch.tensor(
+            [256 / x.shape[-2] for x in self.forward(img_dummy)])
+        self.stride = self.detect.stride
+        self.detect.bias_init()
+        initialize_weights(self)
+
 
     def forward(self, x):
-        x = self.net(x)
-        x = self.fpn(x)
-        return self.head(list(x))
+        x = self.backbone(x)
+        x = self.head(x)
+        return self.detect(list(x))
 
     def fuse(self):
         for m in self.modules():
             if type(m) is Conv and hasattr(m, 'norm'):
                 m.conv = fuse_conv(m.conv, m.norm)
-                m.forward = m.fuse_forward
+                m.forward = m.forward_fuse
                 delattr(m, 'norm')
         return self
 
 
-def yolo_v11_n(num_classes: int = 80):
+def yolo_v11_n(num_cls=80):
     csp = [False, True]
-    depth = [1, 1, 1, 1, 1, 1]
+    depth = [1, 1, 1, 1, 1]
     width = [3, 16, 32, 64, 128, 256]
-    return YOLO(width, depth, csp, num_classes)
+    return YOLO(num_cls, width, depth, csp)
 
 
-def yolo_v11_t(num_classes: int = 80):
+def yolo_v11_s(num_cls=80):
     csp = [False, True]
-    depth = [1, 1, 1, 1, 1, 1]
-    width = [3, 24, 48, 96, 192, 384]
-    return YOLO(width, depth, csp, num_classes)
-
-
-def yolo_v11_s(num_classes: int = 80):
-    csp = [False, True]
-    depth = [1, 1, 1, 1, 1, 1]
+    depth = [1, 1, 1, 1, 1]
     width = [3, 32, 64, 128, 256, 512]
-    return YOLO(width, depth, csp, num_classes)
+
+    return YOLO(num_cls, width, depth, csp)
 
 
-def yolo_v11_m(num_classes: int = 80):
+def yolo_v11_m(num_cls=80):
     csp = [True, True]
-    depth = [1, 1, 1, 1, 1, 1]
+    depth = [1, 1, 1, 1, 1]
     width = [3, 64, 128, 256, 512, 512]
-    return YOLO(width, depth, csp, num_classes)
+
+    return YOLO(num_cls, width, depth, csp)
 
 
-def yolo_v11_l(num_classes: int = 80):
+def yolo_v11_l(num_cls=80):
     csp = [True, True]
-    depth = [2, 2, 2, 2, 2, 2]
+    depth = [2, 2, 2, 2, 2]
     width = [3, 64, 128, 256, 512, 512]
-    return YOLO(width, depth, csp, num_classes)
+    return YOLO(num_cls, width, depth, csp)
 
 
-def yolo_v11_x(num_classes: int = 80):
+def yolo_v11_x(num_cls=80):
     csp = [True, True]
-    depth = [2, 2, 2, 2, 2, 2]
+    depth = [2, 2, 2, 2, 2]
     width = [3, 96, 192, 384, 768, 768]
-    return YOLO(width, depth, csp, num_classes)
+    return YOLO(num_cls, width, depth, csp)

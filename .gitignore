@@ -4,4 +4,4 @@ __pycache__
 *.pyc
 .vscode
 debug
-weights
+weights*
