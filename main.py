@@ -8,6 +8,7 @@ import torch
 import argparse
 import warnings
 import numpy as np
+import time
 from torch.utils import data
 from torch import distributed as dist
 from torch.nn.utils import clip_grad_norm_ as clip
@@ -24,18 +25,12 @@ def train(args, params):
 
     model = nn.yolo_v11_n(args.num_cls)
 
-    # Resume from checkpoint or load pretrained weights
-    start_epoch = 0
-    best = 0
-    if hasattr(args, 'resume') and args.resume:
-        # Resume from checkpoint
-        checkpoint = torch.load(args.resume, map_location=device)
-        model.load_state_dict(checkpoint['model'].state_dict() if hasattr(
-            checkpoint['model'], 'state_dict') else checkpoint['model'])
-        start_epoch = checkpoint.get('epoch', 0)
-        best = checkpoint.get('best', 0)
-        print(f"Resumed training from epoch {start_epoch}")
-    elif hasattr(args, 'weights') and args.weights:
+    # Initialize scaler first
+    use_scaler = device.type == 'cuda'
+    scaler = torch.amp.GradScaler(device=device, enabled=use_scaler)
+
+    # Load pretrained weights if specified (but not checkpoint resume)
+    if hasattr(args, 'weights') and args.weights and not (hasattr(args, 'resume') and args.resume):
         # Load pretrained weights
         from utils.util import load_ultralytics_weight
         model = load_ultralytics_weight(model, args.weights)
@@ -74,22 +69,40 @@ def train(args, params):
     optimizer = util.smart_optimizer(args, model, decay)
     linear = lambda x: (max(1  / args.epochs, 0) * (1.0 - 0.01) + 0.01)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=linear)
-    scheduler.last_epoch = - 1
+    
+    # If resuming, load the complete checkpoint state
+    if hasattr(args, 'resume') and args.resume:
+        # Resume from checkpoint using new checkpoint utilities
+        from utils.util import load_checkpoint
+        _, start_epoch, best_map = load_checkpoint(
+            args.resume, model, optimizer, scheduler, scaler, ema, device=device)
+        print(f"Resumed training from epoch {start_epoch}")
+    
+    # If not resuming or scheduler state wasn't loaded, reset scheduler
+    if not (hasattr(args, 'resume') and args.resume):
+        scheduler.last_epoch = - 1
+    
     criterion = util.DetectionLoss(model)
 
     opt_step = -1
     num_batch = len(loader)
     warm_up = max(round(3 * num_batch), 100)
 
-    best_map = 0.0
+    # Create checkpoint directory if it doesn't exist
+    checkpoint_dir = params.get('checkpoint_dir', 'weights')
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
+    # Initialize error tolerance variables
+    consecutive_errors = 0
+    total_errors = 0
+    
     with open('weights/step.csv', 'w') as log:
         if args.rank == 0:
             logger = csv.DictWriter(log, fieldnames=['epoch',
                                                      'box', 'cls', 'dfl',
                                                      'Recall', 'Precision', 'mAP@50', 'mAP'])
             logger.writeheader()
-        for epoch in range(args.epochs):
+        for epoch in range(start_epoch, args.epochs):
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 scheduler.step()
@@ -108,65 +121,130 @@ def train(args, params):
 
             t_loss = None
             for i, batch in p_bar:
-                glob_step = i + num_batch * epoch
-                if glob_step <= warm_up:
-                    xi = [0, warm_up]
-                    accumulate = max(1, int(np.interp(glob_step, xi, [1, 64 / args.batch_size]).round()))
-                    for j, x in enumerate(optimizer.param_groups):
-                        x["lr"] = np.interp(glob_step, xi, [0.0 if j == 0 else 0.0,
-                                                            x["initial_lr"] * linear(epoch)])
+                # Error tolerance mechanism
+                enable_error_tolerance = params.get('enable_error_tolerance', True)
+                max_consecutive_errors = params.get('max_consecutive_errors', 10)
+                
+                try:
+                    glob_step = i + num_batch * epoch
+                    if glob_step <= warm_up:
+                        xi = [0, warm_up]
+                        accumulate = max(1, int(np.interp(glob_step, xi, [1, 64 / args.batch_size]).round()))
+                        for j, x in enumerate(optimizer.param_groups):
+                            x["lr"] = np.interp(glob_step, xi, [0.0 if j == 0 else 0.0,
+                                                                x["initial_lr"] * linear(epoch)])
 
-                        if "momentum" in x:
-                            x["momentum"] = np.interp(glob_step, xi, [0.8, 0.937])
+                            if "momentum" in x:
+                                x["momentum"] = np.interp(glob_step, xi, [0.8, 0.937])
 
-                images = batch["img"].to(device).float() / 255
+                    images = batch["img"].to(device).float() / 255
 
-                if device.type == 'cuda':
-                    with torch.amp.autocast(device):
-                        pred = model(images)
-                        loss, loss_items = criterion(pred, batch)
-                        if args.distributed:
-                            loss *= args.world_size
+                    if device.type == 'cuda':
+                        with torch.amp.autocast(device):
+                            pred = model(images)
+                            loss, loss_items = criterion(pred, batch)
+                            # Check for NaN or inf losses
+                            if torch.isnan(loss) or torch.isinf(loss):
+                                raise ValueError(f"Loss is NaN or infinite: {loss}")
+                            if args.distributed:
+                                loss *= args.world_size
 
-                        t_loss = ((t_loss * i + loss_items) / (
-                                    i + 1) if t_loss is not None else loss_items)
-                elif device.type == 'mps':
-                    # MPS autocast support
-                    with torch.amp.autocast('cpu'):  # Use CPU autocast for MPS
-                        pred = model(images)
-                        loss, loss_items = criterion(pred, batch)
-                        if args.distributed:
-                            loss *= args.world_size
+                            t_loss = ((t_loss * i + loss_items) / (
+                                        i + 1) if t_loss is not None else loss_items)
+                    elif device.type == 'mps':
+                        # MPS autocast support
+                        with torch.amp.autocast('cpu'):  # Use CPU autocast for MPS
+                            pred = model(images)
+                            loss, loss_items = criterion(pred, batch)
+                            # Check for NaN or inf losses
+                            if torch.isnan(loss) or torch.isinf(loss):
+                                raise ValueError(f"Loss is NaN or infinite: {loss}")
+                            if args.distributed:
+                                loss *= args.world_size
 
-                        t_loss = ((t_loss * i + loss_items) / (
-                                    i + 1) if t_loss is not None else loss_items)
-                else:
-                    pred = model(images)
-                    loss, loss_items = criterion(pred, batch)
-                    if args.distributed:
-                        loss *= args.world_size
-
-                    t_loss = ((t_loss * i + loss_items) / (
-                                i + 1) if t_loss is not None else loss_items)
-
-                if use_scaler:
-                    scaler.scale(loss).backward()
-                else:
-                    loss.backward()
-                    
-                if glob_step - opt_step >= accumulate:
-                    if use_scaler:
-                        scaler.unscale_(optimizer)
-                    clip(model.parameters(), max_norm=10.0)
-                    if use_scaler:
-                        scaler.step(optimizer)
-                        scaler.update()
+                            t_loss = ((t_loss * i + loss_items) / (
+                                        i + 1) if t_loss is not None else loss_items)
                     else:
-                        optimizer.step()
-                    optimizer.zero_grad()
-                    if ema:
-                        ema.update(model)
-                    opt_step = glob_step
+                        pred = model(images)
+                        loss, loss_items = criterion(pred, batch)
+                        # Check for NaN or inf losses
+                        if torch.isnan(loss) or torch.isinf(loss):
+                            raise ValueError(f"Loss is NaN or infinite: {loss}")
+                        if args.distributed:
+                            loss *= args.world_size
+
+                        t_loss = ((t_loss * i + loss_items) / (
+                                    i + 1) if t_loss is not None else loss_items)
+
+                    # Check for gradient explosion
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        raise ValueError(f"Gradient explosion detected: loss={loss}")
+
+                    if use_scaler:
+                        scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
+                        
+                    # Check for gradient NaN or inf
+                    has_nan_grads = False
+                    for param in model.parameters():
+                        if param.grad is not None:
+                            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                has_nan_grads = True
+                                break
+                    
+                    if has_nan_grads:
+                        raise ValueError("Gradient contains NaN or infinite values")
+                        
+                    if glob_step - opt_step >= accumulate:
+                        if use_scaler:
+                            scaler.unscale_(optimizer)
+                        clip(model.parameters(), max_norm=10.0)
+                        if use_scaler:
+                            scaler.step(optimizer)
+                            scaler.update()
+                        else:
+                            optimizer.step()
+                        optimizer.zero_grad()
+                        if ema:
+                            ema.update(model)
+                        opt_step = glob_step
+                        
+                    # Reset consecutive errors counter on successful batch
+                    consecutive_errors = 0
+                    
+                except Exception as e:
+                    # Handle batch error
+                    if enable_error_tolerance:
+                        consecutive_errors += 1
+                        total_errors += 1
+                        
+                        # Log error batch information
+                        error_info = {
+                            'epoch': epoch,
+                            'batch': i,
+                            'error': str(e),
+                            'timestamp': time.time()
+                        }
+                        
+                        # Write error info to log file
+                        error_log_file = params.get('error_log_file', 'weights/error_batches.log')
+                        os.makedirs(os.path.dirname(error_log_file), exist_ok=True)
+                        with open(error_log_file, 'a') as f:
+                            f.write(f"Epoch: {epoch}, Batch: {i}, Error: {str(e)}\n")
+                        
+                        print(f"Warning: Skipping batch {i} in epoch {epoch} due to error: {str(e)}")
+                        
+                        # Zero gradients to prevent accumulation from failed batch
+                        optimizer.zero_grad()
+                        
+                        # Check if we've exceeded max consecutive errors
+                        if consecutive_errors >= max_consecutive_errors:
+                            print(f"Error: Too many consecutive errors ({consecutive_errors}). Stopping training.")
+                            raise RuntimeError(f"Exceeded maximum consecutive errors ({max_consecutive_errors})")
+                    else:
+                        # Re-raise the exception if error tolerance is disabled
+                        raise e
 
                 if args.rank == 0:
                     fmt = "%11s" * 2 + "%11.4g" * 3
@@ -192,14 +270,51 @@ def train(args, params):
                                  'Precision': str(f'{m_pre:.3f}')})
                 log.flush()
 
-                ckpt = {'epoch': epoch+1, 'model': copy.deepcopy(ema.ema)}
-                torch.save(ckpt, 'weights/last.pt')
+                # Save checkpoints based on configuration
+                if args.rank == 0:
+                    from utils.util import save_checkpoint
+                    
+                    # Save last checkpoint if enabled
+                    if params.get('save_last', True):
+                        save_checkpoint(
+                            epoch=epoch,
+                            model=ema.ema if ema else model,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            scaler=scaler,
+                            ema=ema,
+                            best_map=best_map,
+                            filename=f'{checkpoint_dir}/last.pt'
+                        )
+                    
+                    # Save best checkpoint if enabled and current model is better
+                    if params.get('save_best', True) and mean_map > best_map:
+                        best_map = mean_map
+                        save_checkpoint(
+                            epoch=epoch,
+                            model=ema.ema if ema else model,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            scaler=scaler,
+                            ema=ema,
+                            best_map=best_map,
+                            filename=f'{checkpoint_dir}/best.pt'
+                        )
+                    
+                    # Save periodic checkpoints based on frequency
+                    checkpoint_freq = params.get('checkpoint_freq', 1)
+                    if checkpoint_freq > 0 and (epoch + 1) % checkpoint_freq == 0:
+                        save_checkpoint(
+                            epoch=epoch,
+                            model=ema.ema if ema else model,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            scaler=scaler,
+                            ema=ema,
+                            best_map=best_map,
+                            filename=f'{checkpoint_dir}/epoch_{epoch + 1}.pt'
+                        )
 
-                if mean_map > best_map:
-                    best_map = mean_map
-                    torch.save(ckpt, 'weights/best.pt')
-
-                del ckpt
 
             if args.distributed:
                 dist.barrier()
@@ -207,7 +322,7 @@ def train(args, params):
         if args.distributed:
             dist.destroy_process_group()
 
-        print("Training complete.")
+        print(f"Training complete. Total errors encountered: {total_errors}")
 
 
 def validate(args, params, model=None):
@@ -218,8 +333,17 @@ def validate(args, params, model=None):
 
     if not model:
         args.plot = True
-        model = torch.load(f='weights/best.pt', map_location=device, weights_only=False)
-        model = model['model'].float().fuse()
+        # Try to load using the new checkpoint format first
+        try:
+            from utils.util import load_checkpoint
+            import nets.nn as nn
+            temp_model = nn.yolo_v11_n(args.num_cls).to(device)
+            checkpoint, _, _ = load_checkpoint('weights/best.pt', temp_model, device=device)
+            model = temp_model.float().fuse()
+        except:
+            # Fall back to old format
+            model = torch.load(f='weights/best.pt', map_location=device, weights_only=False)
+            model = model['model'].float().fuse()
 
     # model.half()
     model.eval()
@@ -263,7 +387,16 @@ def validate(args, params, model=None):
 
 @torch.no_grad()
 def inference(args, params):
-    model = torch.load('./weights/v11_n.pt', map_location=device, weights_only=False)['model'].float()
+    # Try to load using the new checkpoint format first
+    try:
+        from utils.util import load_checkpoint
+        import nets.nn as nn
+        model = nn.yolo_v11_n(args.num_cls).to(device)
+        load_checkpoint('./weights/best.pt', model, device=device)
+        model = model.float()
+    except:
+        # Fall back to old format
+        model = torch.load('./weights/v11_n.pt', map_location=device, weights_only=False)['model'].float()
     model.half()
     model.eval()
 
@@ -385,6 +518,10 @@ def main():
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--validate', action='store_true')
     parser.add_argument('--inference', action='store_true')
+    parser.add_argument('--evaluate', action='store_true', help='Run evaluation (accuracy and speed)')
+    parser.add_argument('--eval-mode', type=str, default='full', 
+                        choices=['full', 'accuracy', 'speed', 'quick'],
+                        help='Evaluation mode: full, accuracy, speed, or quick')
     parser.add_argument('--weights', type=str, help='Path to weights file')
     parser.add_argument('--resume', type=str,
                         help='Path to checkpoint file for resuming training')
@@ -404,6 +541,27 @@ def main():
         validate(args, params)
     if args.inference:
         inference(args, params)
+    if args.evaluate:
+        # Import and run evaluation
+        import eval
+        eval_args = argparse.Namespace()
+        eval_args.num_cls = args.num_cls
+        eval_args.inp_size = args.inp_size
+        eval_args.batch_size = args.batch_size
+        eval_args.data_dir = args.data_dir
+        eval_args.mode = args.eval_mode
+        
+        evaluator = eval.Evaluator(eval_args, params)
+        
+        # Quick mode - reduced evaluation for faster results
+        if args.eval_mode == 'quick':
+            eval_args.num_images = 10  # Reduced number of images for speed test
+        
+        # Run evaluation
+        metrics = evaluator.run_evaluation(mode=args.eval_mode if args.eval_mode != 'quick' else 'full')
+        
+        # Print report
+        evaluator.print_report()
 
 if __name__ == "__main__":
     main()

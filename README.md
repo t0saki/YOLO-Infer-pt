@@ -26,7 +26,15 @@ conda install pytorch torchvision torchaudio cudatoolkit=10.2 -c pytorch-lts
 ### 🧪 Test/Validate
 
 * Configure your dataset path in `main.py` for testing
-* Run `python main.py --Validate` for validation
+* Run `python main.py --validate` for validation
+
+### 📊 Evaluation (Accuracy and Speed)
+
+* Run `python main.py --evaluate` for full evaluation (accuracy and speed)
+* Run `python main.py --evaluate --eval-mode accuracy` for accuracy-only evaluation
+* Run `python main.py --evaluate --eval-mode speed` for speed-only evaluation
+* Run `python main.py --evaluate --eval-mode quick` for quick evaluation (reduced dataset)
+* Run `python eval.py` directly for evaluation with more options
 
 ### 🔍 Inference (Webcam or Video)
 
