@@ -1032,29 +1032,107 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None, scal
         for module in model.modules()
     )
     
-    # Load model state
+    # Load model state - handle both state dict and complete model objects
     if 'model' in checkpoint:
+        model_data = checkpoint['model']
+        
+        # Check if model_data is a state dict or a complete model object
+        if hasattr(model_data, 'state_dict'):
+            # It's a complete model object, extract state dict
+            print("Detected complete model object in checkpoint, extracting state dict...")
+            try:
+                model.load_state_dict(model_data.state_dict())
+            except Exception as e:
+                if is_quantized_model:
+                    print(f"Warning: Could not load state dict directly into quantized model: {e}")
+                    print("Attempting to load with strict=False...")
+                    try:
+                        model.load_state_dict(model_data.state_dict(), strict=False)
+                        print("Successfully loaded state dict with strict=False")
+                    except Exception as e2:
+                        print(f"Failed to load state dict even with strict=False: {e2}")
+                        raise e2
+                else:
+                    raise e
+        elif isinstance(model_data, dict):
+            # It's a state dict
+            print("Detected state dict in checkpoint...")
+            try:
+                model.load_state_dict(model_data)
+            except Exception as e:
+                if is_quantized_model:
+                    print(f"Warning: Could not load state dict directly into quantized model: {e}")
+                    print("Attempting to load with strict=False...")
+                    try:
+                        model.load_state_dict(model_data, strict=False)
+                        print("Successfully loaded state dict with strict=False")
+                    except Exception as e2:
+                        print(f"Failed to load state dict even with strict=False: {e2}")
+                        raise e2
+                else:
+                    raise e
+        else:
+            # Unknown format, try to handle as best as possible
+            print(f"Warning: Unknown model data format: {type(model_data)}")
+            try:
+                if hasattr(model_data, '__dict__'):
+                    # Try to copy attributes if it's some kind of object
+                    copy_attr(model, model_data)
+                else:
+                    raise ValueError(f"Cannot handle model data of type: {type(model_data)}")
+            except Exception as e:
+                print(f"Error handling unknown model format: {e}")
+                raise e
+                
+    elif hasattr(checkpoint, 'state_dict'):
+        # The checkpoint itself is a complete model object
+        print("Detected complete model object as checkpoint...")
         try:
-            model.load_state_dict(checkpoint['model'])
+            model.load_state_dict(checkpoint.state_dict())
         except Exception as e:
-            # Handle loading into quantized models
             if is_quantized_model:
                 print(f"Warning: Could not load state dict directly into quantized model: {e}")
                 print("Attempting to load with strict=False...")
                 try:
-                    model.load_state_dict(checkpoint['model'], strict=False)
+                    model.load_state_dict(checkpoint.state_dict(), strict=False)
                     print("Successfully loaded state dict with strict=False")
                 except Exception as e2:
                     print(f"Failed to load state dict even with strict=False: {e2}")
                     raise e2
             else:
                 raise e
+                
+    elif isinstance(checkpoint, dict) and not any(key in checkpoint for key in ['model', 'optimizer', 'scheduler', 'scaler', 'ema']):
+        # The checkpoint is a bare state dict
+        print("Detected bare state dict as checkpoint...")
+        try:
+            model.load_state_dict(checkpoint)
+        except Exception as e:
+            if is_quantized_model:
+                print(f"Warning: Could not load state dict directly into quantized model: {e}")
+                print("Attempting to load with strict=False...")
+                try:
+                    model.load_state_dict(checkpoint, strict=False)
+                    print("Successfully loaded state dict with strict=False")
+                except Exception as e2:
+                    print(f"Failed to load state dict even with strict=False: {e2}")
+                    raise e2
+            else:
+                raise e
+                
     elif is_quantized_model:
         # Handle case where checkpoint is a quantized model itself
         try:
             model.load_state_dict(checkpoint, strict=False)
         except Exception as e:
             print(f"Warning: Could not load quantized checkpoint: {e}")
+    else:
+        print("Warning: Could not determine checkpoint format, attempting direct load...")
+        try:
+            model.load_state_dict(checkpoint)
+        except Exception as e:
+            print(f"Direct load failed: {e}")
+            raise e
     
     # Load optimizer state if provided
     if optimizer and 'optimizer' in checkpoint and checkpoint['optimizer'] is not None:
@@ -1086,8 +1164,14 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None, scal
         except Exception as e:
             print(f"Warning: Could not load EMA state: {e}")
     
-    start_epoch = checkpoint.get('epoch', 0) + 1  # Resume from next epoch
-    best_map = checkpoint.get('best_map', 0.0)
+    # Handle epoch and best_map for different checkpoint formats
+    if isinstance(checkpoint, dict):
+        start_epoch = checkpoint.get('epoch', 0) + 1  # Resume from next epoch
+        best_map = checkpoint.get('best_map', 0.0)
+    else:
+        # For complete model objects, no training state to resume
+        start_epoch = 0
+        best_map = 0.0
     
     print(f"Checkpoint loaded. Resuming from epoch {start_epoch}")
     return checkpoint, start_epoch, best_map

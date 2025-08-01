@@ -49,12 +49,23 @@ class Conv(nn.Module):
         self.conv = nn.Conv2d(inp, oup, k, s, self._pad(k, p), d, g, False)
         self.norm = nn.BatchNorm2d(oup)
         self.act = nn.SiLU(inplace=True) if act is True else nn.Identity()
+        self._use_fused = False  # Add flag to control fusion
 
     def forward(self, x):
+        if self._use_fused and hasattr(self, 'forward_fuse'):
+            return self.forward_fuse(x)
         return self.act(self.norm(self.conv(x)))
 
     def forward_fuse(self, x):
         return self.act(self.conv(x))
+    
+    def fuse(self):
+        """Enable fused forward pass"""
+        self._use_fused = True
+        
+    def unfuse(self):
+        """Disable fused forward pass to avoid _backward_hooks errors"""
+        self._use_fused = False
 
     @staticmethod
     def _pad(k, p=None):

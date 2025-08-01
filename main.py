@@ -550,89 +550,119 @@ def inference(args, params):
     if torch.backends.quantized.engine == 'none':
         print("Warning: No quantization engine available. Quantized models may not work properly.")
     
-    # Try to load using the new checkpoint format first
+    weights_path = args.weights if args.weights else os.path.join('.', 'weights', 'best.pt')
+    model = None
+    is_quantized_model = False
+    
+    # Check if this is a quantized model file
+    if 'quantized' in weights_path.lower():
+        print("Detected quantized model path, loading quantized model directly...")
+        is_quantized_model = True
+    
+    # Load the model - handle both complete model objects and state dicts
     try:
-        from utils.util import load_checkpoint
-        import nets.nn as nn
-        model = nn.yolo_v11_n(args.num_cls).to(device)
-        # Check if optimized weights are specified
-        weights_path = args.weights if args.weights else os.path.join('.', 'weights', 'best.pt')
-        load_checkpoint(weights_path, model, device=device)
-        model = model.float()
-    except:
-        # Fall back to old format or optimized model
-        weights_path = args.weights if args.weights else os.path.join('.', 'weights', 'combined.pt')
-        try:
-            # Try loading as a complete model (for quantized models)
-            # First try with weights_only=False for quantized models
-            model = torch.load(weights_path, map_location=device, weights_only=False)
-            
-            # Check if it's a checkpoint with model dict
-            if hasattr(model, 'state_dict') or isinstance(model, dict) and 'model' in model:
-                if isinstance(model, dict):
-                    model = model['model']
-                # If it's already a model, keep it as is (this could be a quantized model)
-        except:
-            # Try loading as a state dict with special handling for quantized models
-            try:
-                import nets.nn as nn
-                temp_model = nn.yolo_v11_n(args.num_cls).to(device)
-                # Handle state dict loading with proper weights_only parameter
-                try:
-                    state_dict = torch.load(weights_path, map_location=device, weights_only=True)
-                except:
-                    # If that fails, try with weights_only=False
-                    state_dict = torch.load(weights_path, map_location=device, weights_only=False)
-                
-                if 'model' in state_dict:
-                    temp_model.load_state_dict(state_dict['model'])
+        # First try to load as a complete model object
+        print(f"Attempting to load model from {weights_path}")
+        checkpoint = torch.load(weights_path, map_location=device, weights_only=False)
+        
+        if hasattr(checkpoint, 'state_dict') or hasattr(checkpoint, 'eval') or hasattr(checkpoint, '__call__'):
+            # This is a complete model object
+            model = checkpoint.to(device) if hasattr(checkpoint, 'to') else checkpoint
+            print(f"Successfully loaded complete model object from {weights_path}")
+        elif isinstance(checkpoint, dict):
+            if 'model' in checkpoint:
+                # This is a checkpoint dict with model key
+                if hasattr(checkpoint['model'], 'state_dict') or hasattr(checkpoint['model'], 'eval'):
+                    # The model is a complete object
+                    model = checkpoint['model'].to(device)
+                    print(f"Successfully loaded model object from checkpoint dict: {weights_path}")
                 else:
-                    temp_model.load_state_dict(state_dict)
-                model = temp_model
-            except:
-                # For quantized models, we need to handle the weights_only parameter correctly
-                try:
-                    # First try with weights_only=False for quantized models
-                    model = torch.load(weights_path, map_location=device, weights_only=False)
-                except:
-                    # If that fails, try with weights_only=True and safe globals
-                    try:
-                        # Add the YOLO class and related classes to safe globals for loading
-                        import nets.nn as nn
-                        torch.serialization.add_safe_globals([nn.YOLO, nn.Backbone, nn.Head, nn.Detect, nn.Conv, nn.CSPBlock, nn.CSP, nn.SPP, nn.PSA, nn.PSABlock, nn.Attention, nn.DFL])
-                        model = torch.load(weights_path, map_location=device, weights_only=True)
-                    except Exception as e:
-                        print(f"Error loading model with safe globals: {e}")
-                        # Last resort: try loading with weights_only=False for quantized models
-                        model = torch.load(weights_path, map_location=device, weights_only=False)
-                
-                # Handle different model formats
-                if isinstance(model, dict) and 'model' in model:
+                    # The model is a state dict
                     import nets.nn as nn
-                    temp_model = nn.yolo_v11_n(args.num_cls).to(device)
-                    temp_model.load_state_dict(model['model'])
-                    model = temp_model
-                elif hasattr(model, 'state_dict') or hasattr(model, 'detect'):
-                    # This is already a model object, keep it as is
-                    pass  # model is already correctly loaded
+                    model = nn.yolo_v11_n(args.num_cls).to(device)
+                    model.load_state_dict(checkpoint['model'])
+                    print(f"Successfully loaded model from state dict in checkpoint: {weights_path}")
+            else:
+                # This is a state dict
+                import nets.nn as nn
+                model = nn.yolo_v11_n(args.num_cls).to(device)
+                model.load_state_dict(checkpoint)
+                print(f"Successfully loaded model from state dict: {weights_path}")
+        else:
+            print("Unknown checkpoint format, trying alternative loading methods...")
+            raise Exception("Unknown checkpoint format")
+            
+    except Exception as e:
+        print(f"Failed to load as complete model: {e}")
+        # Fall back to regular loading methods
+        try:
+            from utils.util import load_checkpoint
+            import nets.nn as nn
+            model = nn.yolo_v11_n(args.num_cls).to(device)
+            load_checkpoint(weights_path, model, device=device)
+            model = model.float()
+            print(f"Successfully loaded regular model from {weights_path}")
+        except Exception as load_err:
+            print(f"All loading methods failed: {load_err}")
+            return
     
-    # Check if this is a quantized model
-    is_quantized_model = any(
-        hasattr(module, '_packed_params') or 
-        'Quantized' in type(module).__name__ or
-        hasattr(module, 'qconfig') and module.qconfig is not None
-        for module in model.modules()
-    )
+    if model is None:
+        print("Error: Failed to load model")
+        return
     
-    # For quantized models, calling eval() might cause issues
+    # For regular (non-quantized) models, convert to float and disable Conv layer fusion
+    if not is_quantized_model:
+        model = model.float()
+        
+        def disable_conv_fusion(module):
+            """Recursively disable fusion for all Conv modules"""
+            for name, child in module.named_children():
+                if hasattr(child, 'unfuse') and callable(child.unfuse):
+                    child.unfuse()
+                    print(f"Disabled fusion for Conv module: {name}")
+                elif hasattr(child, '_use_fused'):
+                    child._use_fused = False
+                    print(f"Disabled fusion flag for module: {name}")
+                # Recursively process child modules
+                disable_conv_fusion(child)
+        
+        print("Disabling Conv layer fusion to avoid forward_fuse errors...")
+        disable_conv_fusion(model)
+    else:
+        # For quantized models, verify the model type
+        is_quantized_model = any(
+            hasattr(module, '_packed_params') or 
+            'Quantized' in type(module).__name__ or
+            hasattr(module, 'qconfig') and module.qconfig is not None
+            for module in model.modules()
+        )
+        print(f"Quantized model verification: {is_quantized_model}")
+    
+    # Set model to evaluation mode safely
     try:
         model.eval()
+        print("Model set to evaluation mode successfully")
     except Exception as e:
-        print(f"Warning: Could not set model to eval mode: {e}")
-        # Continue anyway since we're doing inference
-        # For quantized models, we'll manually set the model to evaluation mode
+        print(f"Warning: Could not set model to eval mode using .eval(): {e}")
+        # For quantized models, manually set training mode
         if hasattr(model, 'training'):
             model.training = False
+            print("Manually set model training mode to False")
+        
+        # For quantized models, recursively set evaluation mode
+        def set_quantized_eval(module):
+            """Safely set quantized model to eval mode"""
+            if hasattr(module, 'training'):
+                module.training = False
+            if hasattr(module, 'children'):
+                for child in module.children():
+                    set_quantized_eval(child)
+        
+        if is_quantized_model:
+            set_quantized_eval(model)
+            print("Set quantized model to evaluation mode manually")
+    
+    print(f"Model loaded successfully. Model type: {type(model)}, Quantized: {is_quantized_model}")
     
     # Setup video capture
     camera = cv2.VideoCapture('input.mp4')
@@ -672,9 +702,12 @@ def inference(args, params):
         return
     
     # Inference loop
+    frame_count = 0
     while camera.isOpened():
         success, frame = camera.read()
         if success:
+            frame_count += 1
+            
             # Ensure frame is in correct format (BGR, uint8)
             if frame.dtype != np.uint8:
                 frame = frame.astype(np.uint8)
@@ -709,20 +742,20 @@ def inference(args, params):
             x = x.unsqueeze(dim=0)
             x = x.to(device)
             
-            # Convert to float32 for CPU inference to avoid dtype mismatch
+            # Convert to float32 for inference to avoid dtype mismatch
             x = x.float()
             x = x / 255
             
-            # For quantized models, ensure the model is in evaluation mode and input is properly formatted
-            if is_quantized_model:
-                # Quantized models work with float tensors in [0, 1] range, which we already have
-                pass
-            else:
-                # For regular models, we might want to use other optimizations
-                pass
-            
-            # Inference
-            outputs = model(x)
+            # Inference with proper error handling
+            try:
+                outputs = model(x)
+                if frame_count == 1:
+                    print("First frame inference successful!")
+            except Exception as e:
+                print(f"Inference error on frame {frame_count}: {e}")
+                print("Skipping frame due to inference error")
+                continue
+                    
             # NMS
             outputs = util.non_max_suppression(outputs, 0.15, 0.2)[0]
             
@@ -758,7 +791,7 @@ def inference(args, params):
     camera.release()
     out.release()
     cv2.destroyAllWindows()
-    print("Video processing completed successfully!")
+    print(f"Video processing completed successfully! Processed {frame_count} frames.")
 
 
 def optimize_model(args, params):
@@ -795,12 +828,34 @@ def optimize_model(args, params):
                 model.load_state_dict(checkpoint)
             print(f"Loaded weights from {args.weights}")
     
+    # Convert model to float and disable all Conv layer fusion BEFORE optimization
+    model = model.float()
+    
+    def disable_conv_fusion(module):
+        """Recursively disable fusion for all Conv modules"""
+        for name, child in module.named_children():
+            if hasattr(child, 'unfuse') and callable(child.unfuse):
+                child.unfuse()
+                print(f"Disabled fusion for Conv module: {name}")
+            elif hasattr(child, '_use_fused'):
+                child._use_fused = False
+                print(f"Disabled fusion flag for module: {name}")
+            # Recursively process child modules
+            disable_conv_fusion(child)
+    
+    print("Disabling Conv layer fusion before optimization to avoid forward_fuse errors...")
+    disable_conv_fusion(model)
+    
     # For quantized models, calling eval() might cause issues
     try:
         model.eval()
+        print("Model set to evaluation mode successfully")
     except Exception as e:
         print(f"Warning: Could not set model to eval mode: {e}")
-        # Continue anyway since we're doing optimization
+        # Manually set training mode to False
+        if hasattr(model, 'training'):
+            model.training = False
+            print("Manually set model training mode to False")
     
     # Apply optimization based on method
     if args.opt_method == 'quantization':
@@ -870,10 +925,10 @@ def optimize_model(args, params):
     os.makedirs(os.path.dirname(args.opt_output), exist_ok=True)
     if args.opt_method == 'quantization':
         optimizer.save_quantized_model(args.opt_output)
+        print(f"Quantized model saved to {args.opt_output}")
     else:
         torch.save(optimized_model.state_dict(), args.opt_output)
-    
-    print(f"Optimized model saved to {args.opt_output}")
+        print(f"Optimized model saved to {args.opt_output}")
     
     # Compare model sizes
     try:
