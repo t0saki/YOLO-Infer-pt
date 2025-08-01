@@ -20,11 +20,9 @@ from nets import nn
 from utils import util
 from utils.dataset import Dataset
 
-
 device = torch.device("cuda" if torch.cuda.is_available(
 ) else "mps" if torch.backends.mps.is_available() else "cpu")
 backend = "qnnpack" if device.type == "mps" else "fbgemm"
-
 
 # Conditional import for evaluation module
 try:
@@ -42,6 +40,71 @@ except ImportError:
     OPTIMIZATION_MODULE_AVAILABLE = False
     print("Warning: optimization module not found. Optimization functionality will be limited.")
 
+def smart_load_model(weights_path, num_classes, target_device=None):
+    """
+    Intelligently load a model from various checkpoint formats
+    Supports both state dicts and complete model objects
+    
+    Args:
+        weights_path: Path to the model file
+        num_classes: Number of classes for the model
+        target_device: Device to load the model to
+        
+    Returns:
+        model: Loaded model ready for use
+    """
+    if target_device is None:
+        target_device = device
+    
+    print(f"Smart loading model from {weights_path}")
+    
+    # First try to load the checkpoint
+    try:
+        # Try with weights_only=True first
+        checkpoint = torch.load(weights_path, map_location=target_device, weights_only=True)
+    except:
+        try:
+            # If that fails, try with weights_only=False
+            checkpoint = torch.load(weights_path, map_location=target_device, weights_only=False)
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}")
+            raise e
+    
+    # Handle different checkpoint formats
+    if hasattr(checkpoint, 'state_dict') or hasattr(checkpoint, 'detect') or hasattr(checkpoint, '__call__'):
+        # This is a complete model object
+        print("Detected complete model object")
+        model = checkpoint.to(target_device) if hasattr(checkpoint, 'to') else checkpoint
+        return model.float()
+        
+    elif isinstance(checkpoint, dict):
+        if 'model' in checkpoint:
+            model_data = checkpoint['model']
+            
+            # Check if model_data is a complete model or state dict
+            if hasattr(model_data, 'state_dict') or hasattr(model_data, 'detect') or hasattr(model_data, '__call__'):
+                # Complete model object in checkpoint
+                print("Detected complete model object in checkpoint dict")
+                model = model_data.to(target_device) if hasattr(model_data, 'to') else model_data
+                return model.float()
+            elif isinstance(model_data, dict):
+                # State dict in checkpoint
+                print("Detected state dict in checkpoint dict")
+                model = nn.yolo_v11_n(num_classes).to(target_device)
+                model.load_state_dict(model_data)
+                return model.float()
+            else:
+                print(f"Unknown model data format in checkpoint: {type(model_data)}")
+                raise ValueError(f"Cannot handle model data of type: {type(model_data)}")
+        else:
+            # This might be a bare state dict
+            print("Attempting to load as bare state dict")
+            model = nn.yolo_v11_n(num_classes).to(target_device)
+            model.load_state_dict(checkpoint)
+            return model.float()
+    else:
+        print(f"Unknown checkpoint format: {type(checkpoint)}")
+        raise ValueError(f"Cannot handle checkpoint of type: {type(checkpoint)}")
 
 def train(args, params):
     """
@@ -368,7 +431,6 @@ def train(args, params):
         
         print(f"Training complete. Total errors encountered: {total_errors}")
 
-
 def validate(args, params, model=None):
     """
     Validate the model performance on validation dataset
@@ -389,86 +451,32 @@ def validate(args, params, model=None):
     # Load model if not provided
     if not model:
         args.plot = True
-        # Try to load using the new checkpoint format first
+        weights_path = args.weights if args.weights else os.path.join('weights', 'best.pt')
         try:
-            from utils.util import load_checkpoint
-            import nets.nn as nn
-            temp_model = nn.yolo_v11_n(args.num_cls).to(device)
-            # Check if weights path is specified
-            weights_path = args.weights if args.weights else os.path.join('weights', 'best.pt')
-            load_checkpoint(weights_path, temp_model, device=device)
-            model = temp_model.float().fuse()
-        except:
-            # Fall back to old format or try optimized model
-            weights_path = args.weights if args.weights else os.path.join('weights', 'best.pt')
+            model = smart_load_model(weights_path, args.num_cls, device)
+            if hasattr(model, 'fuse'):
+                model = model.fuse()
+        except Exception as e:
+            print(f"Error loading model using smart_load_model: {e}")
+            # Fallback to checkpoint loading
             try:
-                # Try loading as a complete model (for quantized models)
-                try:
-                    # First try with weights_only=False for quantized models
-                    model = torch.load(f=weights_path, map_location=device, weights_only=False)
-                except:
-                    # If that fails, try with weights_only=True and safe globals
-                    try:
-                        # Add the YOLO class to safe globals for loading
-                        torch.serialization.add_safe_globals([nn.YOLO])
-                        model = torch.load(f=weights_path, map_location=device, weights_only=True)
-                    except:
-                        # Last resort: try loading with weights_only=True without safe globals
-                        model = torch.load(f=weights_path, map_location=device, weights_only=True)
-                        
-                # Check if it's a checkpoint with model dict
-                if isinstance(model, dict) and 'model' in model:
-                    model = model['model'].float().fuse()
-                elif hasattr(model, 'state_dict') or hasattr(model, 'detect'):
-                    # This is already a model object
-                    model = model.float()
-                # If it's already a model, keep it as is
-            except:
-                # Try loading as a state dict
-                try:
-                    import nets.nn as nn
-                    temp_model = nn.yolo_v11_n(args.num_cls).to(device)
-                    # Handle state dict loading with proper weights_only parameter
-                    try:
-                        state_dict = torch.load(weights_path, map_location=device, weights_only=True)
-                    except:
-                        # If that fails, try with weights_only=False
-                        state_dict = torch.load(weights_path, map_location=device, weights_only=False)
-                    
-                    if 'model' in state_dict:
-                        temp_model.load_state_dict(state_dict['model'])
-                    else:
-                        temp_model.load_state_dict(state_dict)
-                    model = temp_model.float().fuse()
-                except:
-                    # Last resort: try loading with weights_only=True
-                    try:
-                        model = torch.load(f=weights_path, map_location=device, weights_only=True)
-                    except:
-                        # If that fails, try with weights_only=False and safe globals
-                        try:
-                            torch.serialization.add_safe_globals([nn.YOLO])
-                            model = torch.load(f=weights_path, map_location=device, weights_only=False)
-                        except:
-                            # Final fallback
-                            model = torch.load(f=weights_path, map_location=device, weights_only=False)
-                    
-                    if isinstance(model, dict) and 'model' in model:
-                        import nets.nn as nn
-                        temp_model = nn.yolo_v11_n(args.num_cls).to(device)
-                        temp_model.load_state_dict(model['model'])
-                        model = temp_model.float().fuse()
-                    elif hasattr(model, 'state_dict') or hasattr(model, 'detect'):
-                        # This is already a model object
-                        model = model.float()
+                from utils.util import load_checkpoint
+                temp_model = nn.yolo_v11_n(args.num_cls).to(device)
+                load_checkpoint(weights_path, temp_model, device=device)
+                model = temp_model.float()
+                if hasattr(model, 'fuse'):
+                    model = model.fuse()
+            except Exception as e2:
+                print(f"Error with fallback loading: {e2}")
+                raise e2
     
-    # model.half()
     # For quantized models, calling eval() might cause issues
     try:
         model.eval()
     except Exception as e:
         print(f"Warning: Could not set model to eval mode: {e}")
         # Continue anyway since we're doing validation
+    
     dataset = Dataset(args, params, False)
     loader = data.DataLoader(dataset, batch_size=16,
                              shuffle=False, num_workers=4,
@@ -523,7 +531,6 @@ def validate(args, params, model=None):
     model.float()
     return m_pre, m_rec, map50, mean_ap
 
-
 @torch.no_grad()
 def inference(args, params):
     """
@@ -551,69 +558,25 @@ def inference(args, params):
         print("Warning: No quantization engine available. Quantized models may not work properly.")
     
     weights_path = args.weights if args.weights else os.path.join('.', 'weights', 'best.pt')
-    model = None
-    is_quantized_model = False
     
-    # Check if this is a quantized model file
-    if 'quantized' in weights_path.lower():
-        print("Detected quantized model path, loading quantized model directly...")
-        is_quantized_model = True
-    
-    # Load the model - handle both complete model objects and state dicts
+    # Use the smart model loading function
     try:
-        # First try to load as a complete model object
-        print(f"Attempting to load model from {weights_path}")
-        checkpoint = torch.load(weights_path, map_location=device, weights_only=False)
-        
-        if hasattr(checkpoint, 'state_dict') or hasattr(checkpoint, 'eval') or hasattr(checkpoint, '__call__'):
-            # This is a complete model object
-            model = checkpoint.to(device) if hasattr(checkpoint, 'to') else checkpoint
-            print(f"Successfully loaded complete model object from {weights_path}")
-        elif isinstance(checkpoint, dict):
-            if 'model' in checkpoint:
-                # This is a checkpoint dict with model key
-                if hasattr(checkpoint['model'], 'state_dict') or hasattr(checkpoint['model'], 'eval'):
-                    # The model is a complete object
-                    model = checkpoint['model'].to(device)
-                    print(f"Successfully loaded model object from checkpoint dict: {weights_path}")
-                else:
-                    # The model is a state dict
-                    import nets.nn as nn
-                    model = nn.yolo_v11_n(args.num_cls).to(device)
-                    model.load_state_dict(checkpoint['model'])
-                    print(f"Successfully loaded model from state dict in checkpoint: {weights_path}")
-            else:
-                # This is a state dict
-                import nets.nn as nn
-                model = nn.yolo_v11_n(args.num_cls).to(device)
-                model.load_state_dict(checkpoint)
-                print(f"Successfully loaded model from state dict: {weights_path}")
-        else:
-            print("Unknown checkpoint format, trying alternative loading methods...")
-            raise Exception("Unknown checkpoint format")
-            
+        model = smart_load_model(weights_path, args.num_cls, device)
+        print(f"Model loaded successfully using smart_load_model")
     except Exception as e:
-        print(f"Failed to load as complete model: {e}")
-        # Fall back to regular loading methods
-        try:
-            from utils.util import load_checkpoint
-            import nets.nn as nn
-            model = nn.yolo_v11_n(args.num_cls).to(device)
-            load_checkpoint(weights_path, model, device=device)
-            model = model.float()
-            print(f"Successfully loaded regular model from {weights_path}")
-        except Exception as load_err:
-            print(f"All loading methods failed: {load_err}")
-            return
-    
-    if model is None:
-        print("Error: Failed to load model")
+        print(f"Error loading model with smart_load_model: {e}")
         return
     
-    # For regular (non-quantized) models, convert to float and disable Conv layer fusion
+    # Check if this is a quantized model
+    is_quantized_model = any(
+        hasattr(module, '_packed_params') or 
+        'Quantized' in type(module).__name__ or
+        hasattr(module, 'qconfig') and module.qconfig is not None
+        for module in model.modules()
+    )
+    
+    # For regular (non-quantized) models, disable Conv layer fusion
     if not is_quantized_model:
-        model = model.float()
-        
         def disable_conv_fusion(module):
             """Recursively disable fusion for all Conv modules"""
             for name, child in module.named_children():
@@ -629,13 +592,6 @@ def inference(args, params):
         print("Disabling Conv layer fusion to avoid forward_fuse errors...")
         disable_conv_fusion(model)
     else:
-        # For quantized models, verify the model type
-        is_quantized_model = any(
-            hasattr(module, '_packed_params') or 
-            'Quantized' in type(module).__name__ or
-            hasattr(module, 'qconfig') and module.qconfig is not None
-            for module in model.modules()
-        )
         print(f"Quantized model verification: {is_quantized_model}")
     
     # Set model to evaluation mode safely
@@ -793,7 +749,6 @@ def inference(args, params):
     cv2.destroyAllWindows()
     print(f"Video processing completed successfully! Processed {frame_count} frames.")
 
-
 def optimize_model(args, params):
     """
     Optimize the model using specified optimization techniques
@@ -804,29 +759,18 @@ def optimize_model(args, params):
     """
     print(f"Optimizing model with {args.opt_method}...")
     
-    # Load model
-    model = nn.yolo_v11_n(args.num_cls).to(device)
-    
-    # Load weights if specified
+    # Load model using smart loading
     if hasattr(args, 'weights') and args.weights:
         try:
-            from utils.util import load_checkpoint
-            load_checkpoint(args.weights, model, device=device)
+            model = smart_load_model(args.weights, args.num_cls, device)
             print(f"Loaded weights from {args.weights}")
-        except:
-            # Fall back to old format with proper error handling
-            try:
-                # Try with weights_only=True first
-                checkpoint = torch.load(args.weights, map_location=device, weights_only=True)
-            except:
-                # If that fails, try with weights_only=False
-                checkpoint = torch.load(args.weights, map_location=device, weights_only=False)
-            
-            if 'model' in checkpoint:
-                model.load_state_dict(checkpoint['model'])
-            else:
-                model.load_state_dict(checkpoint)
-            print(f"Loaded weights from {args.weights}")
+        except Exception as e:
+            print(f"Error loading model with smart_load_model: {e}")
+            # Fallback to creating new model
+            model = nn.yolo_v11_n(args.num_cls).to(device)
+            print("Created new model instead")
+    else:
+        model = nn.yolo_v11_n(args.num_cls).to(device)
     
     # Convert model to float and disable all Conv layer fusion BEFORE optimization
     model = model.float()
@@ -940,7 +884,6 @@ def optimize_model(args, params):
         print(f"Memory savings: {size_info['memory_savings_mb']:.2f} MB")
     except Exception as e:
         print(f"Could not compare model sizes: {e}")
-
 
 def main():
     """
@@ -1078,7 +1021,6 @@ Examples:
             return
             
         optimize_model(args, params)
-
 
 if __name__ == "__main__":
     main()
