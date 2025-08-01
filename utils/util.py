@@ -12,8 +12,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
-
 def init_seeds(seed=0):
     random.seed(seed)
     np.random.seed(seed)
@@ -538,7 +536,7 @@ def compute_ap(tp, conf, pred, target, plot=False, on_plot=None,
 # ----------------------- Compute AP End ---------------------
 
 # ----------------------------- Metrics & Plotting Start -----
-def update_metrics(preds, batch, niou, iou_v, stats):
+def update_metrics(preds, batch, niou, iou_v, stats, device):
     for i, pred in enumerate(preds):
         stat = dict(conf=torch.zeros(0).to(device), pred_cls=torch.zeros(0).to(device),
                     tp=torch.zeros(len(pred), niou, dtype=torch.bool).to(device))
@@ -552,7 +550,7 @@ def update_metrics(preds, batch, niou, iou_v, stats):
             img_shape = batch["img"].shape[2:]
             tensor = torch.tensor(img_shape).to(device)[[1, 0, 1, 0]]
             box = wh2xy(box) * tensor
-            scale_boxes(box, batch["shape"][i], batch["pad"][i])
+            scale_boxes(box, batch["shape"][i], batch["pad"][i], device)
 
         stat["target_cls"] = cls
         stat["target_img"] = cls.unique()
@@ -587,7 +585,7 @@ def box_iou(box1, box2, eps=1e-7):
     return inter / (union + eps)
 
 
-def scale_boxes(boxes, shape, r_pad):
+def scale_boxes(boxes, shape, r_pad, device):
     gain, pad = r_pad[0][0], r_pad[1]
     boxes[..., :4] -= torch.tensor([pad[0], pad[1], pad[0], pad[1]]).to(device)
     boxes[..., :4] /= gain
@@ -757,7 +755,12 @@ def load_ultralytics_weight(model, ckpt_path, verbose=False):
         model: The model with loaded weights
     """
     # Load the checkpoint
-    checkpoint = torch.load(ckpt_path, weights_only=False)
+    # Try loading with weights_only=True first (PyTorch 2.6+ default)
+    try:
+        checkpoint = torch.load(ckpt_path, weights_only=True)
+    except:
+        # If that fails, try with weights_only=False
+        checkpoint = torch.load(ckpt_path, weights_only=False)
 
     # Extract the model from checkpoint
     src_model = checkpoint['model'].float()
@@ -1014,29 +1017,74 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None, scal
         device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     
     print(f"Loading checkpoint from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # Try loading with weights_only=True first (PyTorch 2.6+ default)
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    except:
+        # If that fails, try with weights_only=False
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    
+    # Handle quantized models
+    is_quantized_model = any(
+        hasattr(module, '_packed_params') or 
+        'Quantized' in type(module).__name__ or
+        hasattr(module, 'qconfig') and module.qconfig is not None
+        for module in model.modules()
+    )
     
     # Load model state
     if 'model' in checkpoint:
-        model.load_state_dict(checkpoint['model'])
+        try:
+            model.load_state_dict(checkpoint['model'])
+        except Exception as e:
+            # Handle loading into quantized models
+            if is_quantized_model:
+                print(f"Warning: Could not load state dict directly into quantized model: {e}")
+                print("Attempting to load with strict=False...")
+                try:
+                    model.load_state_dict(checkpoint['model'], strict=False)
+                    print("Successfully loaded state dict with strict=False")
+                except Exception as e2:
+                    print(f"Failed to load state dict even with strict=False: {e2}")
+                    raise e2
+            else:
+                raise e
+    elif is_quantized_model:
+        # Handle case where checkpoint is a quantized model itself
+        try:
+            model.load_state_dict(checkpoint, strict=False)
+        except Exception as e:
+            print(f"Warning: Could not load quantized checkpoint: {e}")
     
     # Load optimizer state if provided
     if optimizer and 'optimizer' in checkpoint and checkpoint['optimizer'] is not None:
-        optimizer.load_state_dict(checkpoint['optimizer'])
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+        except Exception as e:
+            print(f"Warning: Could not load optimizer state: {e}")
     
     # Load scheduler state if provided
     if scheduler and 'scheduler' in checkpoint and checkpoint['scheduler'] is not None:
-        scheduler.load_state_dict(checkpoint['scheduler'])
+        try:
+            scheduler.load_state_dict(checkpoint['scheduler'])
+        except Exception as e:
+            print(f"Warning: Could not load scheduler state: {e}")
     
     # Load scaler state if provided
     if scaler and 'scaler' in checkpoint and checkpoint['scaler'] is not None:
-        scaler.load_state_dict(checkpoint['scaler'])
+        try:
+            scaler.load_state_dict(checkpoint['scaler'])
+        except Exception as e:
+            print(f"Warning: Could not load scaler state: {e}")
     
     # Load EMA state if provided
     if ema and 'ema' in checkpoint and checkpoint['ema'] is not None:
-        ema.ema.load_state_dict(checkpoint['ema'])
-        if 'ema_updates' in checkpoint:
-            ema.updates = checkpoint['ema_updates']
+        try:
+            ema.ema.load_state_dict(checkpoint['ema'])
+            if 'ema_updates' in checkpoint:
+                ema.updates = checkpoint['ema_updates']
+        except Exception as e:
+            print(f"Warning: Could not load EMA state: {e}")
     
     start_epoch = checkpoint.get('epoch', 0) + 1  # Resume from next epoch
     best_map = checkpoint.get('best_map', 0.0)

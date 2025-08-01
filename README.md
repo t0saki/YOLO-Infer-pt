@@ -75,6 +75,21 @@ python main.py --inference
 
 # Run inference with custom input size
 python main.py --inference --inp-size 512
+
+# Run inference with optimized model
+python main.py --inference --weights weights/optimized_model.pt
+```
+
+#### 7. Model Optimization
+```bash
+# Apply dynamic quantization
+python main.py --optimize --opt-method quantization --quant-type dynamic --opt-output weights/quantized_model.pt
+
+# Apply magnitude pruning
+python main.py --optimize --opt-method pruning --sparsity 0.5 --opt-output weights/pruned_model.pt
+
+# Apply static quantization
+python main.py --optimize --opt-method quantization --quant-type static --opt-output weights/static_quantized_model.pt
 ```
 
 ### 🏋 Train
@@ -131,15 +146,68 @@ python main.py --inference --inp-size 512
 
 ### 🚀 Key Features
 
-* **Breakpoint Training (断点续训)** - Resume training from checkpoints to prevent losing progress
-* **Error Tolerance (错误容忍)** - Continue training even when encountering problematic batches
-* **Comprehensive Evaluation (评估)** - Detailed accuracy and speed metrics with visualization
+* **Breakpoint Training** - Resume training from checkpoints to prevent losing progress
+* **Error Tolerance** - Continue training even when encountering problematic batches
+* **Comprehensive Evaluation** - Detailed accuracy and speed metrics with visualization
 * **Ultralytics Weight Support** - Load pretrained weights from Ultralytics format
 * **Advanced Data Augmentation** - Mosaic, MixUp, HSV, and geometric transformations
 * **Model Exponential Moving Average (EMA)** - Improved model stability and performance
 * **Distributed Training Support** - Train on multiple GPUs for faster convergence
 * **Gradient Clipping** - Prevent gradient explosion during training
 * **Mixed Precision Training** - Reduce memory usage and accelerate training
+* **Model Optimization** - Quantization, pruning, and distillation for model compression and acceleration
+
+### 🛠 Advanced Training Configuration
+
+Training can be customized through `utils/args.yaml`:
+
+### 🧠 Model Optimization
+
+The framework supports various model optimization techniques to reduce model size and improve inference speed:
+
+#### Quantization
+* **Dynamic Quantization**: Quantizes weights after training for immediate size reduction and speedup
+* **Static Quantization**: Quantizes both weights and activations for maximum compression
+* **Quantization-Aware Training (QAT)**: Simulates quantization during training for better accuracy
+
+Quantized models can be used for inference by specifying the quantized model file with the `--weights` argument:
+```bash
+# Run inference with quantized model
+python main.py --inference --weights weights/quantized_model.pt
+
+# Validate quantized model
+python main.py --validate --weights weights/quantized_model.pt
+```
+
+Note: Quantized models require proper quantization engine setup (automatically handled for CPU/MPS devices).
+
+#### Pruning
+* **Magnitude Pruning**: Removes weights with smallest magnitudes
+* **Structured Pruning**: Removes entire channels/filters for hardware-friendly acceleration
+
+#### Distillation
+* **Knowledge Distillation**: Transfers knowledge from a large teacher model to a smaller student model
+
+#### Optimization Command Line Arguments
+
+* `--optimize` - Enable model optimization mode
+* `--opt-method METHOD` - Optimization method: quantization, pruning, or distillation
+* `--opt-output PATH` - Output path for optimized model
+* `--quant-type TYPE` - Quantization type: dynamic, static, or qat
+* `--sparsity VALUE` - Sparsity level for pruning (0.0 to 1.0)
+
+#### Example Usage
+
+```bash
+# Quantize a trained model
+python main.py --optimize --opt-method quantization --weights weights/best.pt --opt-output weights/quantized.pt
+
+# Prune a model with 50% sparsity
+python main.py --optimize --opt-method pruning --sparsity 0.5 --weights weights/best.pt --opt-output weights/pruned.pt
+
+# Evaluate optimized model
+python main.py --evaluate --weights weights/quantized.pt
+```
 
 ### 🛠 Advanced Training Configuration
 
@@ -192,6 +260,9 @@ A: Reduce batch size with `--batch-size` argument or enable mixed precision trai
 
 **Q: Video inference produces no output**
 A: Ensure `input.mp4` exists in the project directory. Check that OpenCV is properly installed and supports the video codec.
+
+**Q: Quantized models fail during inference**
+A: Make sure you're using a PyTorch version with quantization support and that the quantization engine is properly set. For CPU inference, the system uses 'qnnpack' as the quantization engine. If you're still having issues, try running the test script: `python test_quantized_model.py --model-path path/to/your/quantized_model.pt`
 
 **Q: Evaluation metrics are low**
 A: Ensure your dataset is properly formatted and the model is trained for sufficient epochs. Check `utils/args.yaml` for data augmentation settings.
