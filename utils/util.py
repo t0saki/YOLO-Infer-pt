@@ -12,6 +12,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+device = torch.device("cuda" if torch.cuda.is_available(
+) else "mps" if torch.backends.mps.is_available() else "cpu")
+backend = "qnnpack" if device.type == "mps" else "fbgemm"
+
 def init_seeds(seed=0):
     random.seed(seed)
     np.random.seed(seed)
@@ -561,7 +565,7 @@ def update_metrics(preds, batch, niou, iou_v, stats, device):
             continue
 
         output = pred.clone()
-        scale_boxes(output[:, :4], batch["shape"][i], batch["pad"][i])
+        scale_boxes(output[:, :4], batch["shape"][i], batch["pad"][i], device)
 
         stat["conf"] = output[:, 4]
         stat["pred_cls"] = output[:, 5]

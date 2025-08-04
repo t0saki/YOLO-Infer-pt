@@ -127,7 +127,7 @@ python main.py --optimize --opt-method quantization --quant-type static --opt-ou
 * Run `python main.py --evaluate --eval-mode accuracy` for accuracy-only evaluation
 * Run `python main.py --evaluate --eval-mode speed` for speed-only evaluation
 * Run `python main.py --evaluate --eval-mode quick` for quick evaluation (reduced dataset)
-* Run `python eval.py` directly for evaluation with more options
+* Run `python evaluation.py` directly for evaluation with more options
 
 #### Evaluation Command Line Arguments
 

@@ -20,17 +20,15 @@ from nets import nn
 from utils import util
 from utils.dataset import Dataset
 
-device = torch.device("cuda" if torch.cuda.is_available(
-) else "mps" if torch.backends.mps.is_available() else "cpu")
-backend = "qnnpack" if device.type == "mps" else "fbgemm"
+from utils.util import device, backend
 
 # Conditional import for evaluation module
-try:
-    import eval
-    EVAL_MODULE_AVAILABLE = True
-except ImportError:
-    EVAL_MODULE_AVAILABLE = False
-    print("Warning: eval module not found. Evaluation functionality will be limited.")
+# try:
+import evaluation
+EVAL_MODULE_AVAILABLE = True
+# except ImportError:
+#     EVAL_MODULE_AVAILABLE = False
+#     print("Warning: evaluation module not found. Evaluation functionality will be limited.")
 
 # Conditional import for optimization module
 try:
@@ -431,6 +429,7 @@ def train(args, params):
         
         print(f"Training complete. Total errors encountered: {total_errors}")
 
+@torch.no_grad()
 def validate(args, params, model=None):
     """
     Validate the model performance on validation dataset
@@ -443,6 +442,22 @@ def validate(args, params, model=None):
     Returns:
         tuple: (precision, recall, mAP@0.5, mAP@0.5:0.95)
     """
+    # Set quantization engine before loading model
+    if device.type == 'cpu':
+        torch.backends.quantized.engine = 'qnnpack'
+    elif device.type == 'mps':
+        torch.backends.quantized.engine = 'qnnpack'
+    else:
+        # For other devices, try to set a supported engine
+        available_engines = torch.backends.quantized.supported_engines
+        if 'qnnpack' in available_engines:
+            torch.backends.quantized.engine = 'qnnpack'
+        elif available_engines and available_engines[0] != 'none':
+            torch.backends.quantized.engine = available_engines[0]
+
+    # Verify that we have a valid quantization engine
+    if torch.backends.quantized.engine == 'none':
+        print("Warning: No quantization engine available. Quantized models may not work properly.")
     iou_v = torch.linspace(0.5, 0.95, 10)
     n_iou = iou_v.numel()
     
@@ -496,11 +511,14 @@ def validate(args, params, model=None):
         )
         
         if is_quantized_model:
-            # This is a quantized model, use float
+            # Quantized models work with float32 inputs
             image = image.float() / 255
         else:
-            # This is a regular model, can use half precision
-            image = image.half() / 255
+            # For regular models, use half precision on CUDA, float on CPU/MPS
+            if device.type == 'cuda':
+                image = image.half() / 255
+            else:
+                image = image.float() / 255
         for k in ["idx", "cls", "box"]:
             batch[k] = batch[k].to(device)
         
@@ -1002,7 +1020,7 @@ Examples:
         eval_args.data_dir = args.data_dir
         eval_args.mode = args.eval_mode
         
-        evaluator = eval.Evaluator(eval_args, params)
+        evaluator = evaluation.Evaluator(eval_args, params)
         
         # Quick mode - reduced evaluation for faster results
         if args.eval_mode == 'quick':
