@@ -20,7 +20,7 @@ from nets import nn
 from utils import util
 from utils.dataset import Dataset
 
-from utils.util import device, backend
+from utils.util import device, backend, smart_load_model, load_checkpoint
 
 # Conditional import for evaluation module
 # try:
@@ -38,71 +38,6 @@ except ImportError:
     OPTIMIZATION_MODULE_AVAILABLE = False
     print("Warning: optimization module not found. Optimization functionality will be limited.")
 
-def smart_load_model(weights_path, num_classes, target_device=None):
-    """
-    Intelligently load a model from various checkpoint formats
-    Supports both state dicts and complete model objects
-    
-    Args:
-        weights_path: Path to the model file
-        num_classes: Number of classes for the model
-        target_device: Device to load the model to
-        
-    Returns:
-        model: Loaded model ready for use
-    """
-    if target_device is None:
-        target_device = device
-    
-    print(f"Smart loading model from {weights_path}")
-    
-    # First try to load the checkpoint
-    try:
-        # Try with weights_only=True first
-        checkpoint = torch.load(weights_path, map_location=target_device, weights_only=True)
-    except:
-        try:
-            # If that fails, try with weights_only=False
-            checkpoint = torch.load(weights_path, map_location=target_device, weights_only=False)
-        except Exception as e:
-            print(f"Error loading checkpoint: {e}")
-            raise e
-    
-    # Handle different checkpoint formats
-    if hasattr(checkpoint, 'state_dict') or hasattr(checkpoint, 'detect') or hasattr(checkpoint, '__call__'):
-        # This is a complete model object
-        print("Detected complete model object")
-        model = checkpoint.to(target_device) if hasattr(checkpoint, 'to') else checkpoint
-        return model.float()
-        
-    elif isinstance(checkpoint, dict):
-        if 'model' in checkpoint:
-            model_data = checkpoint['model']
-            
-            # Check if model_data is a complete model or state dict
-            if hasattr(model_data, 'state_dict') or hasattr(model_data, 'detect') or hasattr(model_data, '__call__'):
-                # Complete model object in checkpoint
-                print("Detected complete model object in checkpoint dict")
-                model = model_data.to(target_device) if hasattr(model_data, 'to') else model_data
-                return model.float()
-            elif isinstance(model_data, dict):
-                # State dict in checkpoint
-                print("Detected state dict in checkpoint dict")
-                model = nn.yolo_v11_n(num_classes).to(target_device)
-                model.load_state_dict(model_data)
-                return model.float()
-            else:
-                print(f"Unknown model data format in checkpoint: {type(model_data)}")
-                raise ValueError(f"Cannot handle model data of type: {type(model_data)}")
-        else:
-            # This might be a bare state dict
-            print("Attempting to load as bare state dict")
-            model = nn.yolo_v11_n(num_classes).to(target_device)
-            model.load_state_dict(checkpoint)
-            return model.float()
-    else:
-        print(f"Unknown checkpoint format: {type(checkpoint)}")
-        raise ValueError(f"Cannot handle checkpoint of type: {type(checkpoint)}")
 
 def train(args, params):
     """
@@ -475,7 +410,6 @@ def validate(args, params, model=None):
             print(f"Error loading model using smart_load_model: {e}")
             # Fallback to checkpoint loading
             try:
-                from utils.util import load_checkpoint
                 temp_model = nn.yolo_v11_n(args.num_cls).to(device)
                 load_checkpoint(weights_path, temp_model, device=device)
                 model = temp_model.float()

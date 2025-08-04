@@ -999,183 +999,320 @@ def save_checkpoint(epoch, model, optimizer, scheduler, scaler, ema, best_map, f
     print(f"Checkpoint saved to {filename}")
 
 
-def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None, scaler=None, ema=None, device=None):
+# def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None, scaler=None, ema=None, device=None):
+#     """
+#     Load complete training state from checkpoint file
+    
+#     Args:
+#         checkpoint_path: Path to checkpoint file
+#         model: Model object to load weights into
+#         optimizer: Optimizer object (optional)
+#         scheduler: Learning rate scheduler object (optional)
+#         scaler: Gradient scaler object (optional)
+#         ema: EMA object (optional)
+#         device: Device to load checkpoint to
+        
+#     Returns:
+#         checkpoint: Loaded checkpoint dictionary
+#         start_epoch: Epoch to resume from
+#         best_map: Best mAP from checkpoint
+#     """
+#     if device is None:
+#         device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+    
+#     print(f"Loading checkpoint from {checkpoint_path}")
+#     # Try loading with weights_only=True first (PyTorch 2.6+ default)
+#     try:
+#         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+#     except:
+#         # If that fails, try with weights_only=False
+#         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    
+#     # Handle quantized models
+#     is_quantized_model = any(
+#         hasattr(module, '_packed_params') or 
+#         'Quantized' in type(module).__name__ or
+#         hasattr(module, 'qconfig') and module.qconfig is not None
+#         for module in model.modules()
+#     )
+    
+#     # Load model state - handle both state dict and complete model objects
+#     if 'model' in checkpoint:
+#         model_data = checkpoint['model']
+        
+#         # Check if model_data is a state dict or a complete model object
+#         if hasattr(model_data, 'state_dict'):
+#             # It's a complete model object, extract state dict
+#             print("Detected complete model object in checkpoint, extracting state dict...")
+#             try:
+#                 model.load_state_dict(model_data.state_dict())
+#             except Exception as e:
+#                 if is_quantized_model:
+#                     print(f"Warning: Could not load state dict directly into quantized model: {e}")
+#                     print("Attempting to load with strict=False...")
+#                     try:
+#                         model.load_state_dict(model_data.state_dict(), strict=False)
+#                         print("Successfully loaded state dict with strict=False")
+#                     except Exception as e2:
+#                         print(f"Failed to load state dict even with strict=False: {e2}")
+#                         raise e2
+#                 else:
+#                     raise e
+#         elif isinstance(model_data, dict):
+#             # It's a state dict
+#             print("Detected state dict in checkpoint...")
+#             try:
+#                 model.load_state_dict(model_data)
+#             except Exception as e:
+#                 if is_quantized_model:
+#                     print(f"Warning: Could not load state dict directly into quantized model: {e}")
+#                     print("Attempting to load with strict=False...")
+#                     try:
+#                         model.load_state_dict(model_data, strict=False)
+#                         print("Successfully loaded state dict with strict=False")
+#                     except Exception as e2:
+#                         print(f"Failed to load state dict even with strict=False: {e2}")
+#                         raise e2
+#                 else:
+#                     raise e
+#         else:
+#             # Unknown format, try to handle as best as possible
+#             print(f"Warning: Unknown model data format: {type(model_data)}")
+#             try:
+#                 if hasattr(model_data, '__dict__'):
+#                     # Try to copy attributes if it's some kind of object
+#                     copy_attr(model, model_data)
+#                 else:
+#                     raise ValueError(f"Cannot handle model data of type: {type(model_data)}")
+#             except Exception as e:
+#                 print(f"Error handling unknown model format: {e}")
+#                 raise e
+                
+#     elif hasattr(checkpoint, 'state_dict'):
+#         # The checkpoint itself is a complete model object
+#         print("Detected complete model object as checkpoint...")
+#         try:
+#             model.load_state_dict(checkpoint.state_dict())
+#         except Exception as e:
+#             if is_quantized_model:
+#                 print(f"Warning: Could not load state dict directly into quantized model: {e}")
+#                 print("Attempting to load with strict=False...")
+#                 try:
+#                     model.load_state_dict(checkpoint.state_dict(), strict=False)
+#                     print("Successfully loaded state dict with strict=False")
+#                 except Exception as e2:
+#                     print(f"Failed to load state dict even with strict=False: {e2}")
+#                     raise e2
+#             else:
+#                 raise e
+                
+#     elif isinstance(checkpoint, dict) and not any(key in checkpoint for key in ['model', 'optimizer', 'scheduler', 'scaler', 'ema']):
+#         # The checkpoint is a bare state dict
+#         print("Detected bare state dict as checkpoint...")
+#         try:
+#             model.load_state_dict(checkpoint)
+#         except Exception as e:
+#             if is_quantized_model:
+#                 print(f"Warning: Could not load state dict directly into quantized model: {e}")
+#                 print("Attempting to load with strict=False...")
+#                 try:
+#                     model.load_state_dict(checkpoint, strict=False)
+#                     print("Successfully loaded state dict with strict=False")
+#                 except Exception as e2:
+#                     print(f"Failed to load state dict even with strict=False: {e2}")
+#                     raise e2
+#             else:
+#                 raise e
+                
+#     elif is_quantized_model:
+#         # Handle case where checkpoint is a quantized model itself
+#         try:
+#             model.load_state_dict(checkpoint, strict=False)
+#         except Exception as e:
+#             print(f"Warning: Could not load quantized checkpoint: {e}")
+#     else:
+#         print("Warning: Could not determine checkpoint format, attempting direct load...")
+#         try:
+#             model.load_state_dict(checkpoint)
+#         except Exception as e:
+#             print(f"Direct load failed: {e}")
+#             raise e
+    
+#     # Load optimizer state if provided
+#     if optimizer and 'optimizer' in checkpoint and checkpoint['optimizer'] is not None:
+#         try:
+#             optimizer.load_state_dict(checkpoint['optimizer'])
+#         except Exception as e:
+#             print(f"Warning: Could not load optimizer state: {e}")
+    
+#     # Load scheduler state if provided
+#     if scheduler and 'scheduler' in checkpoint and checkpoint['scheduler'] is not None:
+#         try:
+#             scheduler.load_state_dict(checkpoint['scheduler'])
+#         except Exception as e:
+#             print(f"Warning: Could not load scheduler state: {e}")
+    
+#     # Load scaler state if provided
+#     if scaler and 'scaler' in checkpoint and checkpoint['scaler'] is not None:
+#         try:
+#             scaler.load_state_dict(checkpoint['scaler'])
+#         except Exception as e:
+#             print(f"Warning: Could not load scaler state: {e}")
+    
+#     # Load EMA state if provided
+#     if ema and 'ema' in checkpoint and checkpoint['ema'] is not None:
+#         try:
+#             ema.ema.load_state_dict(checkpoint['ema'])
+#             if 'ema_updates' in checkpoint:
+#                 ema.updates = checkpoint['ema_updates']
+#         except Exception as e:
+#             print(f"Warning: Could not load EMA state: {e}")
+    
+#     # Handle epoch and best_map for different checkpoint formats
+#     if isinstance(checkpoint, dict):
+#         start_epoch = checkpoint.get('epoch', 0) + 1  # Resume from next epoch
+#         best_map = checkpoint.get('best_map', 0.0)
+#     else:
+#         # For complete model objects, no training state to resume
+#         start_epoch = 0
+#         best_map = 0.0
+    
+#     print(f"Checkpoint loaded. Resuming from epoch {start_epoch}")
+#     return checkpoint, start_epoch, best_map
+
+
+def smart_load_model(weights_path, num_classes, target_device=None):
     """
-    Load complete training state from checkpoint file
+    Intelligently load a model from various checkpoint formats
+    Supports both state dicts and complete model objects, including quantized models
     
     Args:
-        checkpoint_path: Path to checkpoint file
-        model: Model object to load weights into
-        optimizer: Optimizer object (optional)
-        scheduler: Learning rate scheduler object (optional)
-        scaler: Gradient scaler object (optional)
-        ema: EMA object (optional)
-        device: Device to load checkpoint to
+        weights_path: Path to the model file
+        num_classes: Number of classes for the model
+        target_device: Device to load the model to
         
     Returns:
-        checkpoint: Loaded checkpoint dictionary
-        start_epoch: Epoch to resume from
-        best_map: Best mAP from checkpoint
+        model: Loaded model ready for use
     """
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
-    
-    print(f"Loading checkpoint from {checkpoint_path}")
-    # Try loading with weights_only=True first (PyTorch 2.6+ default)
+    if target_device is None:
+        target_device = device
+
+    print(f"Smart loading model from {weights_path}")
+
+    # First try to load the checkpoint
     try:
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        # Try with weights_only=True first
+        checkpoint = torch.load(
+            weights_path, map_location=target_device, weights_only=True)
     except:
-        # If that fails, try with weights_only=False
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    
-    # Handle quantized models
-    is_quantized_model = any(
-        hasattr(module, '_packed_params') or 
-        'Quantized' in type(module).__name__ or
-        hasattr(module, 'qconfig') and module.qconfig is not None
-        for module in model.modules()
-    )
-    
-    # Load model state - handle both state dict and complete model objects
-    if 'model' in checkpoint:
-        model_data = checkpoint['model']
-        
-        # Check if model_data is a state dict or a complete model object
-        if hasattr(model_data, 'state_dict'):
-            # It's a complete model object, extract state dict
-            print("Detected complete model object in checkpoint, extracting state dict...")
-            try:
-                model.load_state_dict(model_data.state_dict())
-            except Exception as e:
-                if is_quantized_model:
-                    print(f"Warning: Could not load state dict directly into quantized model: {e}")
-                    print("Attempting to load with strict=False...")
-                    try:
-                        model.load_state_dict(model_data.state_dict(), strict=False)
-                        print("Successfully loaded state dict with strict=False")
-                    except Exception as e2:
-                        print(f"Failed to load state dict even with strict=False: {e2}")
-                        raise e2
-                else:
-                    raise e
-        elif isinstance(model_data, dict):
-            # It's a state dict
-            print("Detected state dict in checkpoint...")
-            try:
-                model.load_state_dict(model_data)
-            except Exception as e:
-                if is_quantized_model:
-                    print(f"Warning: Could not load state dict directly into quantized model: {e}")
-                    print("Attempting to load with strict=False...")
-                    try:
-                        model.load_state_dict(model_data, strict=False)
-                        print("Successfully loaded state dict with strict=False")
-                    except Exception as e2:
-                        print(f"Failed to load state dict even with strict=False: {e2}")
-                        raise e2
-                else:
-                    raise e
-        else:
-            # Unknown format, try to handle as best as possible
-            print(f"Warning: Unknown model data format: {type(model_data)}")
-            try:
-                if hasattr(model_data, '__dict__'):
-                    # Try to copy attributes if it's some kind of object
-                    copy_attr(model, model_data)
-                else:
-                    raise ValueError(f"Cannot handle model data of type: {type(model_data)}")
-            except Exception as e:
-                print(f"Error handling unknown model format: {e}")
-                raise e
-                
-    elif hasattr(checkpoint, 'state_dict'):
-        # The checkpoint itself is a complete model object
-        print("Detected complete model object as checkpoint...")
         try:
-            model.load_state_dict(checkpoint.state_dict())
+            # If that fails, try with weights_only=False
+            checkpoint = torch.load(
+                weights_path, map_location=target_device, weights_only=False)
         except Exception as e:
-            if is_quantized_model:
-                print(f"Warning: Could not load state dict directly into quantized model: {e}")
-                print("Attempting to load with strict=False...")
-                try:
-                    model.load_state_dict(checkpoint.state_dict(), strict=False)
-                    print("Successfully loaded state dict with strict=False")
-                except Exception as e2:
-                    print(f"Failed to load state dict even with strict=False: {e2}")
-                    raise e2
-            else:
-                raise e
-                
-    elif isinstance(checkpoint, dict) and not any(key in checkpoint for key in ['model', 'optimizer', 'scheduler', 'scaler', 'ema']):
-        # The checkpoint is a bare state dict
-        print("Detected bare state dict as checkpoint...")
-        try:
-            model.load_state_dict(checkpoint)
-        except Exception as e:
-            if is_quantized_model:
-                print(f"Warning: Could not load state dict directly into quantized model: {e}")
-                print("Attempting to load with strict=False...")
-                try:
-                    model.load_state_dict(checkpoint, strict=False)
-                    print("Successfully loaded state dict with strict=False")
-                except Exception as e2:
-                    print(f"Failed to load state dict even with strict=False: {e2}")
-                    raise e2
-            else:
-                raise e
-                
-    elif is_quantized_model:
-        # Handle case where checkpoint is a quantized model itself
-        try:
-            model.load_state_dict(checkpoint, strict=False)
-        except Exception as e:
-            print(f"Warning: Could not load quantized checkpoint: {e}")
-    else:
-        print("Warning: Could not determine checkpoint format, attempting direct load...")
-        try:
-            model.load_state_dict(checkpoint)
-        except Exception as e:
-            print(f"Direct load failed: {e}")
+            print(f"Error loading checkpoint: {e}")
             raise e
-    
-    # Load optimizer state if provided
-    if optimizer and 'optimizer' in checkpoint and checkpoint['optimizer'] is not None:
+
+    # Check if this is a quantized model by looking for quantized modules
+    def is_quantized_model(model):
+        """Check if a model contains quantized modules"""
+        if not hasattr(model, 'modules'):
+            return False
         try:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-        except Exception as e:
-            print(f"Warning: Could not load optimizer state: {e}")
-    
-    # Load scheduler state if provided
-    if scheduler and 'scheduler' in checkpoint and checkpoint['scheduler'] is not None:
-        try:
-            scheduler.load_state_dict(checkpoint['scheduler'])
-        except Exception as e:
-            print(f"Warning: Could not load scheduler state: {e}")
-    
-    # Load scaler state if provided
-    if scaler and 'scaler' in checkpoint and checkpoint['scaler'] is not None:
-        try:
-            scaler.load_state_dict(checkpoint['scaler'])
-        except Exception as e:
-            print(f"Warning: Could not load scaler state: {e}")
-    
-    # Load EMA state if provided
-    if ema and 'ema' in checkpoint and checkpoint['ema'] is not None:
-        try:
-            ema.ema.load_state_dict(checkpoint['ema'])
-            if 'ema_updates' in checkpoint:
-                ema.updates = checkpoint['ema_updates']
-        except Exception as e:
-            print(f"Warning: Could not load EMA state: {e}")
-    
-    # Handle epoch and best_map for different checkpoint formats
-    if isinstance(checkpoint, dict):
-        start_epoch = checkpoint.get('epoch', 0) + 1  # Resume from next epoch
-        best_map = checkpoint.get('best_map', 0.0)
+            for module in model.modules():
+                if (hasattr(module, '_packed_params') or
+                    'Quantized' in type(module).__name__ or
+                        (hasattr(module, 'qconfig') and module.qconfig is not None)):
+                    return True
+        except:
+            # If we can't iterate through modules, assume it might be quantized
+            # if the model type suggests it
+            return 'quantized' in str(type(model)).lower()
+        return False
+
+    # Handle different checkpoint formats
+    if hasattr(checkpoint, 'state_dict') or hasattr(checkpoint, 'detect') or hasattr(checkpoint, '__call__'):
+        # This is a complete model object
+        print("Detected complete model object")
+
+        # Check if it's a quantized model
+        if is_quantized_model(checkpoint):
+            print("Detected quantized model - using special handling")
+            # For quantized models, don't call .to() as it may cause issues
+            # Just return the model as-is (it should already be loaded to the correct device)
+            model = checkpoint
+
+            # Try to set to eval mode safely
+            try:
+                model.eval()
+            except Exception as e:
+                print(
+                    f"Warning: Could not set quantized model to eval mode: {e}")
+                # Manually set training mode for quantized models
+                if hasattr(model, 'training'):
+                    model.training = False
+
+            return model
+        else:
+            # For regular models, use the normal path
+            model = checkpoint.to(target_device) if hasattr(
+                checkpoint, 'to') else checkpoint
+            return model.float()
+
+    elif isinstance(checkpoint, dict):
+        if 'model' in checkpoint:
+            model_data = checkpoint['model']
+
+            # Check if model_data is a complete model or state dict
+            if hasattr(model_data, 'state_dict') or hasattr(model_data, 'detect') or hasattr(model_data, '__call__'):
+                # Complete model object in checkpoint
+                print("Detected complete model object in checkpoint dict")
+
+                # Check if it's a quantized model
+                if is_quantized_model(model_data):
+                    print(
+                        "Detected quantized model in checkpoint - using special handling")
+                    # For quantized models, don't call .to() as it may cause issues
+                    model = model_data
+
+                    # Try to set to eval mode safely
+                    try:
+                        model.eval()
+                    except Exception as e:
+                        print(
+                            f"Warning: Could not set quantized model to eval mode: {e}")
+                        if hasattr(model, 'training'):
+                            model.training = False
+
+                    return model
+                else:
+                    # For regular models, use the normal path
+                    model = model_data.to(target_device) if hasattr(
+                        model_data, 'to') else model_data
+                    return model.float()
+
+            elif isinstance(model_data, dict):
+                # State dict in checkpoint
+                print("Detected state dict in checkpoint dict")
+                model = nn.yolo_v11_n(num_classes).to(target_device)
+                model.load_state_dict(model_data)
+                return model.float()
+            else:
+                print(
+                    f"Unknown model data format in checkpoint: {type(model_data)}")
+                raise ValueError(
+                    f"Cannot handle model data of type: {type(model_data)}")
+        else:
+            # This might be a bare state dict
+            print("Attempting to load as bare state dict")
+            model = nn.yolo_v11_n(num_classes).to(target_device)
+            model.load_state_dict(checkpoint)
+            return model.float()
     else:
-        # For complete model objects, no training state to resume
-        start_epoch = 0
-        best_map = 0.0
-    
-    print(f"Checkpoint loaded. Resuming from epoch {start_epoch}")
-    return checkpoint, start_epoch, best_map
+        print(f"Unknown checkpoint format: {type(checkpoint)}")
+        raise ValueError(
+            f"Cannot handle checkpoint of type: {type(checkpoint)}")
+
+
+def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None, scaler=None, ema=None, device=None):
+    return smart_load_model(checkpoint_path, model.num_classes, device)
