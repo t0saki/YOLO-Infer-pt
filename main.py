@@ -527,24 +527,12 @@ def inference(args, params):
         for module in model.modules()
     )
     
-    # For regular (non-quantized) models, disable Conv layer fusion
-    if not is_quantized_model:
-        def disable_conv_fusion(module):
-            """Recursively disable fusion for all Conv modules"""
-            for name, child in module.named_children():
-                if hasattr(child, 'unfuse') and callable(child.unfuse):
-                    child.unfuse()
-                    print(f"Disabled fusion for Conv module: {name}")
-                elif hasattr(child, '_use_fused'):
-                    child._use_fused = False
-                    print(f"Disabled fusion flag for module: {name}")
-                # Recursively process child modules
-                disable_conv_fusion(child)
-        
-        print("Disabling Conv layer fusion to avoid forward_fuse errors...")
-        disable_conv_fusion(model)
-    else:
-        print(f"Quantized model verification: {is_quantized_model}")
+    # For regular (non-quantized) models, try to fuse layers for performance
+    # Note: Quantized models are typically fused during the quantization process.
+    if not is_quantized_model and hasattr(model, 'fuse'):
+        print("Fusing model for faster inference...")
+        model.fuse()
+
     
     # Set model to evaluation mode safely
     try:
@@ -650,9 +638,14 @@ def inference(args, params):
             x = x.unsqueeze(dim=0)
             x = x.to(device)
             
-            # Convert to float32 for inference to avoid dtype mismatch
-            x = x.float()
-            x = x / 255
+            # Use float for regular models and quantized models that expect float input
+            # For static quantized models expecting uint8, this would need adjustment
+            if is_quantized_model and device.type == 'cpu':
+                 # For CPU quantized model, uint8 input is often expected for static quantization
+                 # but dynamic quantization expects float. Let's stick to float for broader compatibility for now.
+                x = x.float() / 255.0
+            else:
+                x = x.float() / 255.0
             
             # Inference with proper error handling
             try:
@@ -772,18 +765,30 @@ def optimize_model(args, params):
             print("Applying static quantization...")
             # For static quantization, we need to prepare and then convert with calibration
             try:
+                print("Fusing model before quantization...")
+                model.fuse()  # Fuse layers for better quantization performance
+
                 optimizer.static_quantization_prepare(backend=backend)
-                # Try to create a simple calibration dataset
-                try:
-                    # Create a dummy calibration dataset for basic calibration
-                    print("Running calibration...")
-                    # We'll create a simple calibration using dummy data
-                    # In practice, you would use real data from your dataset
-                    calibration_loader = None  # No calibration data for now
-                    optimized_model = optimizer.static_quantization_convert(calibration_loader)
-                except Exception as e:
-                    print(f"Calibration failed, converting without calibration: {e}")
-                    optimized_model = optimizer.static_quantization_convert()
+                
+                # Create a real calibration dataset from the validation set
+                print("Creating calibration data loader...")
+                # Use a subset of the validation dataset for calibration
+                # Using the full validation set is fine, but a subset (e.g., 100-200 images) is usually sufficient
+                calib_dataset = Dataset(args, params, augments=False)
+                
+                # You can uncomment the next line to use a smaller subset for faster calibration
+                # calib_dataset.labels = calib_dataset.labels[:200] 
+                
+                calib_loader = data.DataLoader(calib_dataset, 
+                                               batch_size=args.batch_size // 2 or 1, # Use a smaller batch size for calibration
+                                               shuffle=False, 
+                                               num_workers=4, 
+                                               pin_memory=True, 
+                                               collate_fn=Dataset.collate_fn)
+
+                print(f"Running calibration with up to 100 batches...")
+                optimized_model = optimizer.static_quantization_convert(calib_loader, num_calibration_batches=100)
+
             except RuntimeError as e:
                 if "NoQEngine" in str(e):
                     print("Static quantization failed due to missing quantization engine in your PyTorch installation.")

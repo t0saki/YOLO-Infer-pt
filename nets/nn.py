@@ -345,6 +345,11 @@ def initialize_weights(model):
 class YOLO(torch.nn.Module):
     def __init__(self, num_cls, width, depth, csp):
         super().__init__()
+        # Add QuantStub and DeQuantStub for quantization
+        # These act as entry and exit points for quantization
+        self.quant = torch.quantization.QuantStub()
+        self.dequant = torch.quantization.DeQuantStub()
+
         self.backbone = Backbone(width, depth, csp)
         self.head = Head(width, depth, csp)
 
@@ -358,9 +363,13 @@ class YOLO(torch.nn.Module):
 
 
     def forward(self, x):
+        # Pass input through QuantStub to convert from float to quantized format
+        x = self.quant(x)
         x = self.backbone(x)
         x = self.head(x)
-        return self.detect(list(x))
+        x = self.detect(list(x))
+        # Pass output through DeQuantStub to convert from quantized format back to float
+        return self.dequant(x)
 
     def fuse(self):
         for m in self.modules():

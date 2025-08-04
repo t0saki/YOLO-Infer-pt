@@ -1181,7 +1181,7 @@ def save_checkpoint(epoch, model, optimizer, scheduler, scaler, ema, best_map, f
 #     return checkpoint, start_epoch, best_map
 
 
-def smart_load_model(weights_path, num_classes, target_device=None):
+def smart_load_model(weights_path, num_classes=80, target_device=None):
     """
     Intelligently load a model from various checkpoint formats
     Supports both state dicts and complete model objects, including quantized models
@@ -1315,4 +1315,4 @@ def smart_load_model(weights_path, num_classes, target_device=None):
 
 
 def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None, scaler=None, ema=None, device=None):
-    return smart_load_model(checkpoint_path, model.num_classes, device)
+    return smart_load_model(checkpoint_path, target_device=device)

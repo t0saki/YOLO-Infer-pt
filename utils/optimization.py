@@ -138,6 +138,12 @@ class QuantizationOptimizer:
         if self.quantized_model is None:
             raise RuntimeError("Model not prepared for static quantization. Call static_quantization_prepare first.")
             
+        # if no self.quantized_model.quant()
+        if "quant" not in self.quantized_model._modules:
+            self.quantized_model.quant = torch.quantization.QuantStub()
+            self.quantized_model.dequant = torch.quantization.DeQuantStub()
+            
+
         # If calibration data is provided, run calibration
         if calibration_data_loader is not None:
             self.quantized_model.eval()
