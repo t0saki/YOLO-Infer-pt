@@ -5,6 +5,7 @@ Main entry point for training, validation, inference, and evaluation
 
 import os
 import csv
+import traceback
 import cv2
 import tqdm
 import yaml
@@ -364,6 +365,7 @@ def train(args, params):
         
         print(f"Training complete. Total errors encountered: {total_errors}")
 
+
 @torch.no_grad()
 def validate(args, params, model=None):
     """
@@ -395,17 +397,17 @@ def validate(args, params, model=None):
         print("Warning: No quantization engine available. Quantized models may not work properly.")
     iou_v = torch.linspace(0.5, 0.95, 10)
     n_iou = iou_v.numel()
-    
-    metric = {"tp": [], "conf": [], "pred_cls": [], "target_cls": [], "target_img": []}
-    
+
+    metric = {"tp": [], "conf": [], "pred_cls": [],
+              "target_cls": [], "target_img": []}
+
     # Load model if not provided
     if not model:
         args.plot = True
-        weights_path = args.weights if args.weights else os.path.join('weights', 'best.pt')
+        weights_path = args.weights if args.weights else os.path.join(
+            'weights', 'best.pt')
         try:
             model = smart_load_model(weights_path, args.num_cls, device)
-            if hasattr(model, 'fuse'):
-                model = model.fuse()
         except Exception as e:
             print(f"Error loading model using smart_load_model: {e}")
             # Fallback to checkpoint loading
@@ -418,32 +420,35 @@ def validate(args, params, model=None):
             except Exception as e2:
                 print(f"Error with fallback loading: {e2}")
                 raise e2
-    
-    # For quantized models, calling eval() might cause issues
-    try:
-        model.eval()
-    except Exception as e:
-        print(f"Warning: Could not set model to eval mode: {e}")
+
+    # **[FIX]** Check if the model is quantized BEFORE trying to call .eval()
+    is_quantized_model = any(
+        hasattr(module, '_packed_params') or
+        'Quantized' in type(module).__name__ or
+        (hasattr(module, 'qconfig') and module.qconfig is not None)
+        for module in model.modules()
+    )
+
+    # For quantized models, calling eval() will cause issues. Skip it.
+    if not is_quantized_model:
+        try:
+            model.eval()
+        except Exception as e:
+            print(f"Warning: Could not set model to eval mode: {e}")
+    else:
+        print("Skipping .eval() for quantized model as it is already in eval state.")
         # Continue anyway since we're doing validation
-    
+
     dataset = Dataset(args, params, False)
     loader = data.DataLoader(dataset, batch_size=16,
                              shuffle=False, num_workers=4,
                              pin_memory=True, collate_fn=Dataset.collate_fn)
-    
+
     # Validation loop
     for batch in tqdm.tqdm(loader, desc=('%10s' * 5) % (
-    '', 'precision', 'recall', 'mAP50', 'mAP')):
+            '', 'precision', 'recall', 'mAP50', 'mAP')):
         image = batch["img"].to(device)
-        # For quantized models, we need to use float, not half
-        # Check if this is a quantized model by looking for quantized modules
-        is_quantized_model = any(
-            hasattr(module, '_packed_params') or 
-            'Quantized' in type(module).__name__ or
-            hasattr(module, 'qconfig') and module.qconfig is not None
-            for module in model.modules()
-        )
-        
+
         if is_quantized_model:
             # Quantized models work with float32 inputs
             image = image.float() / 255
@@ -479,9 +484,13 @@ def validate(args, params, model=None):
         m_pre, m_rec, map50, mean_ap = 0.0, 0.0, 0.0, 0.0
     
     print(('%10s' + '%10.3g' * 4) % ('', m_pre, m_rec, map50, mean_ap))
-    
-    model.float()
+
+    # # It's good practice to ensure model is float after validation for any further use
+    # if hasattr(model, 'float'):
+    #     model.float()
+
     return m_pre, m_rec, map50, mean_ap
+
 
 @torch.no_grad()
 def inference(args, params):
@@ -504,13 +513,14 @@ def inference(args, params):
             torch.backends.quantized.engine = 'qnnpack'
         elif available_engines and available_engines[0] != 'none':
             torch.backends.quantized.engine = available_engines[0]
-    
+
     # Verify that we have a valid quantization engine
     if torch.backends.quantized.engine == 'none':
         print("Warning: No quantization engine available. Quantized models may not work properly.")
-    
-    weights_path = args.weights if args.weights else os.path.join('.', 'weights', 'best.pt')
-    
+
+    weights_path = args.weights if args.weights else os.path.join(
+        '.', 'weights', 'best.pt')
+
     # Use the smart model loading function
     try:
         model = smart_load_model(weights_path, args.num_cls, device)
@@ -518,48 +528,33 @@ def inference(args, params):
     except Exception as e:
         print(f"Error loading model with smart_load_model: {e}")
         return
-    
+
     # Check if this is a quantized model
     is_quantized_model = any(
-        hasattr(module, '_packed_params') or 
-        'Quantized' in type(module).__name__ or
-        hasattr(module, 'qconfig') and module.qconfig is not None
+        'quantized' in str(type(module)).lower()
         for module in model.modules()
     )
-    
-    # For regular (non-quantized) models, try to fuse layers for performance
-    # Note: Quantized models are typically fused during the quantization process.
+
+    # DO NOT fuse a loaded model. A quantized model is already fused.
+    # A regular model should be fused before saving if needed for speed.
     if not is_quantized_model and hasattr(model, 'fuse'):
         print("Fusing model for faster inference...")
         model.fuse()
 
-    
-    # Set model to evaluation mode safely
-    try:
-        model.eval()
-        print("Model set to evaluation mode successfully")
-    except Exception as e:
-        print(f"Warning: Could not set model to eval mode using .eval(): {e}")
-        # For quantized models, manually set training mode
-        if hasattr(model, 'training'):
-            model.training = False
-            print("Manually set model training mode to False")
-        
-        # For quantized models, recursively set evaluation mode
-        def set_quantized_eval(module):
-            """Safely set quantized model to eval mode"""
-            if hasattr(module, 'training'):
-                module.training = False
-            if hasattr(module, 'children'):
-                for child in module.children():
-                    set_quantized_eval(child)
-        
-        if is_quantized_model:
-            set_quantized_eval(model)
-            print("Set quantized model to evaluation mode manually")
-    
-    print(f"Model loaded successfully. Model type: {type(model)}, Quantized: {is_quantized_model}")
-    
+    # **[FIX]** Only call .eval() on non-quantized models
+    if not is_quantized_model:
+        try:
+            model.eval()
+            print("Model set to evaluation mode successfully")
+        except Exception as e:
+            print(
+                f"Warning: Could not set model to eval mode using .eval(): {e}")
+    else:
+        print("Skipping .eval() for quantized model as it is already in eval state.")
+
+    print(
+        f"Model loaded successfully. Model type: {type(model)}, Quantized: {is_quantized_model}")
+
     # Setup video capture
     camera = cv2.VideoCapture('input.mp4')
     
@@ -654,6 +649,7 @@ def inference(args, params):
                     print("First frame inference successful!")
             except Exception as e:
                 print(f"Inference error on frame {frame_count}: {e}")
+                traceback.print_exc()
                 print("Skipping frame due to inference error")
                 continue
                     
@@ -694,6 +690,7 @@ def inference(args, params):
     cv2.destroyAllWindows()
     print(f"Video processing completed successfully! Processed {frame_count} frames.")
 
+
 def optimize_model(args, params):
     """
     Optimize the model using specified optimization techniques
@@ -703,7 +700,7 @@ def optimize_model(args, params):
         params: Configuration parameters
     """
     print(f"Optimizing model with {args.opt_method}...")
-    
+
     # Load model using smart loading
     if hasattr(args, 'weights') and args.weights:
         try:
@@ -716,112 +713,74 @@ def optimize_model(args, params):
             print("Created new model instead")
     else:
         model = nn.yolo_v11_n(args.num_cls).to(device)
-    
-    # Convert model to float and disable all Conv layer fusion BEFORE optimization
+
+    # Convert model to float BEFORE optimization
     model = model.float()
-    
-    def disable_conv_fusion(module):
-        """Recursively disable fusion for all Conv modules"""
-        for name, child in module.named_children():
-            if hasattr(child, 'unfuse') and callable(child.unfuse):
-                child.unfuse()
-                print(f"Disabled fusion for Conv module: {name}")
-            elif hasattr(child, '_use_fused'):
-                child._use_fused = False
-                print(f"Disabled fusion flag for module: {name}")
-            # Recursively process child modules
-            disable_conv_fusion(child)
-    
-    print("Disabling Conv layer fusion before optimization to avoid forward_fuse errors...")
-    disable_conv_fusion(model)
-    
-    # For quantized models, calling eval() might cause issues
-    try:
-        model.eval()
-        print("Model set to evaluation mode successfully")
-    except Exception as e:
-        print(f"Warning: Could not set model to eval mode: {e}")
-        # Manually set training mode to False
-        if hasattr(model, 'training'):
-            model.training = False
-            print("Manually set model training mode to False")
-    
+
+    # Set model to evaluation mode
+    model.eval()
+    print("Model set to evaluation mode successfully")
+
     # Apply optimization based on method
     if args.opt_method == 'quantization':
+        # Ensure optimization module is available
+        if not OPTIMIZATION_MODULE_AVAILABLE:
+            print("Error: Optimization module not found. Cannot run quantization.")
+            return
+
         optimizer = optimization.QuantizationOptimizer(model)
-        
+
         if args.quant_type == 'dynamic':
+            # Dynamic quantization is not recommended for ConvNets and won't give speedup
             print("Applying dynamic quantization...")
-            try:
-                optimized_model = optimizer.dynamic_quantization()
-            except RuntimeError as e:
-                if "NoQEngine" in str(e):
-                    print("Dynamic quantization failed due to missing quantization engine in your PyTorch installation.")
-                    print("Consider reinstalling PyTorch with full quantization support, or try static quantization instead.")
-                    return
-                else:
-                    raise e
+            optimized_model = optimizer.dynamic_quantization()
+
         elif args.quant_type == 'static':
             print("Applying static quantization...")
-            # For static quantization, we need to prepare and then convert with calibration
             try:
+                # 1. Fuse the model FIRST. This is crucial for static quantization.
                 print("Fusing model before quantization...")
-                model.fuse()  # Fuse layers for better quantization performance
+                model.fuse()
 
+                # 2. Prepare the model for static quantization
                 optimizer.static_quantization_prepare(backend=backend)
-                
-                # Create a real calibration dataset from the validation set
+
+                # 3. Create a calibration data loader
                 print("Creating calibration data loader...")
-                # Use a subset of the validation dataset for calibration
-                # Using the full validation set is fine, but a subset (e.g., 100-200 images) is usually sufficient
                 calib_dataset = Dataset(args, params, augments=False)
-                
-                # You can uncomment the next line to use a smaller subset for faster calibration
-                # calib_dataset.labels = calib_dataset.labels[:200] 
-                
-                calib_loader = data.DataLoader(calib_dataset, 
-                                               batch_size=args.batch_size // 2 or 1, # Use a smaller batch size for calibration
-                                               shuffle=False, 
-                                               num_workers=4, 
-                                               pin_memory=True, 
+                calib_loader = data.DataLoader(calib_dataset,
+                                               batch_size=args.batch_size // 2 or 1,
+                                               shuffle=False,
+                                               num_workers=4,
+                                               pin_memory=True,
                                                collate_fn=Dataset.collate_fn)
 
+                # 4. Calibrate and convert the model
                 print(f"Running calibration with up to 100 batches...")
-                optimized_model = optimizer.static_quantization_convert(calib_loader, num_calibration_batches=100)
+                optimized_model = optimizer.static_quantization_convert(
+                    calib_loader, num_calibration_batches=100)
 
             except RuntimeError as e:
                 if "NoQEngine" in str(e):
-                    print("Static quantization failed due to missing quantization engine in your PyTorch installation.")
-                    print("Consider reinstalling PyTorch with full quantization support.")
-                    return
-                else:
-                    raise e
-        elif args.quant_type == 'qat':
-            print("Preparing for quantization-aware training...")
-            try:
-                optimized_model = optimizer.quantization_aware_training_prepare(backend=backend)
-            except RuntimeError as e:
-                if "NoQEngine" in str(e):
-                    print("Quantization-aware training preparation failed due to missing quantization engine in your PyTorch installation.")
-                    print("Consider reinstalling PyTorch with full quantization support.")
+                    print(
+                        "Static quantization failed due to missing quantization engine in your PyTorch installation.")
+                    print(
+                        "Consider reinstalling PyTorch with full quantization support.")
                     return
                 else:
                     raise e
         else:
             raise ValueError(f"Unknown quantization type: {args.quant_type}")
-            
+
     elif args.opt_method == 'pruning':
+        # ... (pruning logic remains the same)
         optimizer = optimization.PruningOptimizer(model)
         print(f"Applying pruning with sparsity {args.sparsity}...")
         optimized_model = optimizer.magnitude_pruning(sparsity=args.sparsity)
-        
-    elif args.opt_method == 'distillation':
-        print("Distillation requires a teacher model. Please use the optimization module directly for this.")
-        return
-        
+
     else:
         raise ValueError(f"Unknown optimization method: {args.opt_method}")
-    
+
     # Save optimized model
     os.makedirs(os.path.dirname(args.opt_output), exist_ok=True)
     if args.opt_method == 'quantization':
@@ -830,7 +789,7 @@ def optimize_model(args, params):
     else:
         torch.save(optimized_model.state_dict(), args.opt_output)
         print(f"Optimized model saved to {args.opt_output}")
-    
+
     # Compare model sizes
     try:
         size_info = optimization.compare_model_sizes(model, optimized_model)
@@ -841,6 +800,7 @@ def optimize_model(args, params):
         print(f"Memory savings: {size_info['memory_savings_mb']:.2f} MB")
     except Exception as e:
         print(f"Could not compare model sizes: {e}")
+
 
 def main():
     """

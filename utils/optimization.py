@@ -119,9 +119,10 @@ class QuantizationOptimizer:
         
         return self.quantized_model
         
+
     def static_quantization_convert(self, 
-                                  calibration_data_loader=None,
-                                  num_calibration_batches=10) -> nn.Module:
+                                    calibration_data_loader=None,
+                                    num_calibration_batches=10) -> nn.Module:
         """
         Convert prepared model to statically quantized model (second step)
         
@@ -133,29 +134,28 @@ class QuantizationOptimizer:
             Quantized model
         """
         if not TORCH_QUANT_AVAILABLE:
-            raise RuntimeError("PyTorch quantization is not available")
+             raise RuntimeError("PyTorch quantization is not available")
             
         if self.quantized_model is None:
-            raise RuntimeError("Model not prepared for static quantization. Call static_quantization_prepare first.")
+             raise RuntimeError("Model not prepared for static quantization. Call static_quantization_prepare first.")
             
         # if no self.quantized_model.quant()
         if "quant" not in self.quantized_model._modules:
             self.quantized_model.quant = torch.quantization.QuantStub()
             self.quantized_model.dequant = torch.quantization.DeQuantStub()
             
-
         # If calibration data is provided, run calibration
         if calibration_data_loader is not None:
             self.quantized_model.eval()
             with torch.no_grad():
-                for i, batch in enumerate(calibration_data_loader):
+                 for i, batch in enumerate(calibration_data_loader):
                     if i >= num_calibration_batches:
                         break
                     # Handle different batch formats
                     if isinstance(batch, dict) and "img" in batch:
                         images = batch["img"]
                     elif isinstance(batch, (list, tuple)):
-                        images = batch[0]  # Assume first element is images
+                        images = batch[0]   # Assume first element is images
                     else:
                         images = batch
                         
@@ -171,14 +171,17 @@ class QuantizationOptimizer:
         try:
             torch.quantization.convert(self.quantized_model, inplace=True)
         except RuntimeError as e:
-            if "NoQEngine" in str(e) or "quantized::" in str(e):
-                print("Static quantization conversion failed due to missing quantization engine.")
-                print("This may be due to your PyTorch installation not including quantization support.")
-                print("Consider reinstalling PyTorch with full quantization support.")
-                raise e
-            else:
-                raise e
+             if "NoQEngine" in str(e) or "quantized::" in str(e):
+                 print("Static quantization conversion failed due to missing quantization engine.")
+                 print("This may be due to your PyTorch installation not including quantization support.")
+                 print("Consider reinstalling PyTorch with full quantization support.")
+                 raise e
+             else:
+                 raise e
                 
+        # **[FIX]** Set to eval mode AFTER conversion and BEFORE saving
+        self.quantized_model.eval()
+        
         self.is_quantized = True
         
         return self.quantized_model
